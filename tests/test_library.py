@@ -173,11 +173,45 @@ class LibraryTests(unittest.TestCase):
 
         migrated = Library(legacy_path)
         self.addCleanup(migrated.close)
-        self.assertEqual(migrated.connection.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(migrated.connection.execute("PRAGMA user_version").fetchone()[0], 4)
         self.assertEqual(len(migrated.pages_needing_visual_scan()), 1)
         self.assertEqual(migrated.search("priority inversion")[0]["page_id"], 1)
         migrated.save_visual_text(1, "handwritten priority inheritance")
         self.assertEqual(migrated.search("priority inheritance")[0]["visual_text"], "handwritten priority inheritance")
+
+
+    def test_default_agents_are_seeded_and_editable(self) -> None:
+        agents = self.library.agents()
+        self.assertEqual([agent["name"] for agent in agents], ["Tutor", "Explainer", "Free chat"])
+        self.assertEqual({agent["notes_mode"] for agent in agents}, {"strict", "blend", "off"})
+        new_id = self.library.save_agent({
+            "name": "OS TA", "model": "llama3.1:8b", "temperature": 0.4, "notes_mode": "strict",
+            "reasoning": True, "accent": "#ff6ac1", "system_prompt": "Be terse.",
+        })
+        self.assertEqual(self.library.agent(new_id)["model"], "llama3.1:8b")
+        self.library.save_agent({**self.library.agent(new_id), "name": "OS TA 2"})
+        self.assertEqual(self.library.agent(new_id)["name"], "OS TA 2")
+        with self.assertRaises(ValueError):
+            self.library.save_agent({"name": "", "notes_mode": "strict"})
+        with self.assertRaises(ValueError):
+            self.library.save_agent({"name": "x", "notes_mode": "sometimes"})
+        self.library.delete_agent(new_id)
+        self.assertIsNone(self.library.agent(new_id))
+
+    def test_class_history_is_separated_per_agent(self) -> None:
+        tutor, explainer = (agent["id"] for agent in self.library.agents()[:2])
+        self.library.save_class_chat("CS 354", "Q tutor", "A", [], tutor)
+        self.library.save_class_chat("CS 354", "Q explainer", "A", [], explainer)
+        self.assertEqual([h["question"] for h in self.library.class_chat_history("CS 354", agent_id=tutor)], ["Q tutor"])
+        self.assertEqual(len(self.library.class_chat_history("CS 354")), 2)
+        self.library.clear_class_chat("CS 354", tutor)
+        self.assertEqual([h["question"] for h in self.library.class_chat_history("CS 354")], ["Q explainer"])
+
+
+    def test_question_retrieval_can_match_any_term(self) -> None:
+        question = "How does Xinu handle priority inversion?"
+        self.assertEqual(self.library.search(question), [])
+        self.assertEqual(len(self.library.search(question, match_any=True)), 1)
 
 
 if __name__ == "__main__":

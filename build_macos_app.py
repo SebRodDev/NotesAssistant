@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-APP_NAME = "Purdue Study Assistant"
+APP_NAME = "Cortex"
 APP_IDENTIFIER = "edu.purdue.studyassistant"
 
 
@@ -30,14 +30,6 @@ def build_arguments() -> list[str]:
         str(ROOT / "build"),
         "--collect-all",
         "pymupdf",
-        "--collect-all",
-        "google.genai",
-        "--copy-metadata",
-        "keyring",
-        "--collect-submodules",
-        "keyring.backends",
-        "--hidden-import",
-        "keyring.backends.macOS",
     ]
 
 

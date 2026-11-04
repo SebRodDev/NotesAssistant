@@ -17,12 +17,51 @@ def database_path() -> Path:
     return data_dir / "study_assistant.sqlite3"
 
 
+DEFAULT_AGENTS = [
+    {
+        "name": "Tutor",
+        "temperature": 0.2,
+        "notes_mode": "strict",
+        "reasoning": False,
+        "accent": "#9b87f5",
+        "system_prompt": (
+            "You are Tutor, a precise study assistant for a Purdue CS student. Answer clearly and directly "
+            "from the student's lecture notes, keep answers short unless asked for detail, and cite the pages "
+            "you used."
+        ),
+    },
+    {
+        "name": "Explainer",
+        "temperature": 0.6,
+        "notes_mode": "blend",
+        "reasoning": True,
+        "accent": "#2ee6d6",
+        "system_prompt": (
+            "You are Explainer, a patient TA. Start from what the lecture notes say, then build intuition with "
+            "a small example or analogy. Walk through steps for algorithms and proofs. Flag anything you add "
+            "beyond the notes."
+        ),
+    },
+    {
+        "name": "Free chat",
+        "temperature": 0.8,
+        "notes_mode": "off",
+        "reasoning": False,
+        "accent": "#e8e8ee",
+        "system_prompt": "You are a helpful, friendly assistant. Answer clearly and directly, and keep answers short unless asked for detail.",
+    },
+]
+
+
 _SEARCH_STOP_WORDS = {
     "a", "an", "and", "are", "about", "can", "could", "cover", "covered", "does", "do",
     "explain", "find", "for", "give", "how", "in", "is", "it", "me", "of", "on", "page",
     "pages", "please", "show", "slide", "slides", "tell", "the", "this", "to", "what", "where",
     "which", "why", "with",
 }
+
+
+MAX_LEARNED_MEMORIES = 200
 
 
 class Library:
@@ -135,7 +174,96 @@ class Library:
             )
         if version < 3:
             self.connection.execute("PRAGMA user_version = 3")
+        if version < 4:
+            # v4: local agents + per-agent chat history (Ollama rewrite).
+            chat_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(class_chat_messages)")}
+            if "agent_id" not in chat_columns:
+                self.connection.execute("ALTER TABLE class_chat_messages ADD COLUMN agent_id INTEGER")
+            self.connection.execute("PRAGMA user_version = 4")
+        if version < 5:
+            # v5: every conversation is saved, including lecture and all-materials ('' class) scopes.
+            chat_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(class_chat_messages)")}
+            if "lecture_name" not in chat_columns:
+                self.connection.execute(
+                    "ALTER TABLE class_chat_messages ADD COLUMN lecture_name TEXT NOT NULL DEFAULT ''"
+                )
+            self.connection.execute("PRAGMA user_version = 5")
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                temperature REAL NOT NULL DEFAULT 0.3,
+                notes_mode TEXT NOT NULL DEFAULT 'strict',
+                reasoning INTEGER NOT NULL DEFAULT 0,
+                accent TEXT NOT NULL DEFAULT '#9b87f5',
+                system_prompt TEXT NOT NULL DEFAULT '',
+                position INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        if not self.connection.execute("SELECT 1 FROM agents LIMIT 1").fetchone():
+            for position, agent in enumerate(DEFAULT_AGENTS):
+                self.connection.execute(
+                    """INSERT INTO agents(name, model, temperature, notes_mode, reasoning, accent, system_prompt, position)
+                       VALUES (?, '', ?, ?, ?, ?, ?, ?)""",
+                    (agent["name"], agent["temperature"], agent["notes_mode"], int(agent["reasoning"]),
+                     agent["accent"], agent["system_prompt"], position),
+                )
         self.connection.commit()
+
+    # -- agents ------------------------------------------------------------------------------
+    def agents(self) -> list[dict]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM agents ORDER BY position, id")]
+
+    def agent(self, agent_id: int) -> dict | None:
+        row = self.connection.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+        return dict(row) if row else None
+
+    def save_agent(self, agent: dict) -> int:
+        name = str(agent.get("name", "")).strip()
+        if not name:
+            raise ValueError("An agent needs a name.")
+        if agent.get("notes_mode") not in {"strict", "blend", "off"}:
+            raise ValueError("Unknown notes mode.")
+        temperature = float(agent.get("temperature", 0.3))
+        if not math.isfinite(temperature) or not 0 <= temperature <= 2:
+            raise ValueError("Creativity must be between 0 and 2.")
+        values = (
+            name, str(agent.get("model") or "").strip(), temperature, agent["notes_mode"],
+            int(bool(agent.get("reasoning"))), str(agent.get("accent") or "#9b87f5"),
+            str(agent.get("system_prompt") or "").strip(),
+        )
+        with self.connection:
+            if agent.get("id"):
+                self.connection.execute(
+                    """UPDATE agents SET name=?, model=?, temperature=?, notes_mode=?, reasoning=?, accent=?,
+                       system_prompt=? WHERE id=?""",
+                    (*values, agent["id"]),
+                )
+                return int(agent["id"])
+            position = self.connection.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM agents").fetchone()[0]
+            cursor = self.connection.execute(
+                """INSERT INTO agents(name, model, temperature, notes_mode, reasoning, accent, system_prompt, position)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (*values, position),
+            )
+            return int(cursor.lastrowid)
+
+    def delete_agent(self, agent_id: int) -> None:
+        if self.connection.execute("SELECT COUNT(*) FROM agents").fetchone()[0] <= 1:
+            raise ValueError("Keep at least one agent.")
+        with self.connection:
+            self.connection.execute("DELETE FROM agents WHERE id=?", (agent_id,))
+            self.connection.execute("DELETE FROM class_chat_messages WHERE agent_id=?", (agent_id,))
 
     def import_pdf(self, class_name: str, lecture_name: str, file_path: Path, page_texts: list[str]) -> None:
         """Replace an existing import at this path and save one record per page."""
@@ -388,8 +516,13 @@ class Library:
         model: str | None = None,
         class_name: str | None = None,
         lecture_name: str | None = None,
+        match_any: bool = False,
     ) -> list[dict]:
-        """Combine keyword and vector rankings with reciprocal-rank fusion."""
+        """Combine keyword and vector rankings with reciprocal-rank fusion.
+
+        match_any ranks pages that contain any query term (BM25 still favours pages with more
+        of them), which suits natural-language questions; the default requires every term.
+        """
         if limit < 1:
             raise ValueError("Search result limit must be positive.")
         if query_embedding is not None and any(not math.isfinite(value) for value in query_embedding):
@@ -398,7 +531,7 @@ class Library:
         terms = [term for term in raw_terms if term not in _SEARCH_STOP_WORDS] or raw_terms
         if not terms:
             return []
-        match_query = " AND ".join(f'"{term}"' for term in terms)
+        match_query = (" OR " if match_any else " AND ").join(f'"{term}"' for term in terms)
         scope_clauses = []
         scope_parameters = []
         if class_name:
@@ -456,7 +589,47 @@ class Library:
 
         return sorted(ranked.values(), key=lambda item: item["score"], reverse=True)[:limit]
 
-    def save_class_chat(self, class_name: str, question: str, answer: str, sources: list[dict]) -> None:
+    # -- long-term memory ----------------------------------------------------------------------
+    def memories(self) -> list[dict]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM memories ORDER BY id DESC")]
+
+    def add_memory(self, content: str, pinned: bool = False) -> None:
+        """Save a fact. Pinned facts came from the student and survive the cap on learned ones."""
+        content = " ".join(content.split())
+        if not content:
+            raise ValueError("A memory can't be blank.")
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO memories(content, pinned) VALUES (?, ?)
+                   ON CONFLICT(content) DO UPDATE SET pinned=MAX(pinned, excluded.pinned)""",
+                (content, int(pinned)),
+            )
+            self.connection.execute(
+                """DELETE FROM memories WHERE pinned=0 AND id NOT IN
+                   (SELECT id FROM memories WHERE pinned=0 ORDER BY id DESC LIMIT ?)""",
+                (MAX_LEARNED_MEMORIES,),
+            )
+
+    def delete_memory(self, memory_id: int) -> None:
+        with self.connection:
+            self.connection.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+
+    def clear_memories(self) -> None:
+        with self.connection:
+            self.connection.execute("DELETE FROM memories")
+
+    def relevant_memories(self, query: str, limit: int = 8) -> list[str]:
+        """The facts sharing the most words with the query, newest first on ties."""
+        terms = set(re.findall(r"[\w'-]+", query.casefold())) - _SEARCH_STOP_WORDS
+        rows = self.memories()
+        rows.sort(key=lambda row: len(terms & set(re.findall(r"[\w'-]+", row["content"].casefold()))), reverse=True)
+        return [row["content"] for row in rows[:limit]]
+
+    # -- conversations ---------------------------------------------------------------------------
+    def save_class_chat(
+        self, class_name: str, question: str, answer: str, sources: list[dict], agent_id: int | None = None,
+        lecture_name: str = "",
+    ) -> int:
         safe_sources = [
             {key: source.get(key) for key in (
                 "class_name", "lecture_name", "file_path", "page_number", "text", "visual_text", "page_id"
@@ -464,28 +637,61 @@ class Library:
             for source in sources
         ]
         with self.connection:
-            self.connection.execute(
-                "INSERT INTO class_chat_messages(class_name, question, answer, sources_json) VALUES (?, ?, ?, ?)",
-                (class_name, question, answer, json.dumps(safe_sources)),
+            cursor = self.connection.execute(
+                """INSERT INTO class_chat_messages(class_name, lecture_name, question, answer, sources_json, agent_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (class_name, lecture_name, question, answer, json.dumps(safe_sources), agent_id),
             )
+            return int(cursor.lastrowid)
 
-    def class_chat_history(self, class_name: str, limit: int = 100) -> list[dict]:
+    @staticmethod
+    def _chat_filter(class_name: str, agent_id: int | None, lecture_name: str | None) -> tuple[str, list]:
+        clause, parameters = "class_name=?", [class_name]
+        if agent_id is not None:
+            clause += " AND (agent_id=? OR agent_id IS NULL)"
+            parameters.append(agent_id)
+        if lecture_name is not None:
+            clause += " AND lecture_name=?"
+            parameters.append(lecture_name)
+        return clause, parameters
+
+    def class_chat_history(
+        self, class_name: str, limit: int = 100, agent_id: int | None = None, lecture_name: str | None = None,
+    ) -> list[dict]:
+        """Saved Q&A for a class ('' is all materials), optionally for one agent or lecture.
+
+        With agent_id, chats from before agents existed are included too. lecture_name='' means
+        the class as a whole, while None means every lecture in it.
+        """
         if limit < 1:
             raise ValueError("Chat history limit must be positive.")
+        clause, parameters = self._chat_filter(class_name, agent_id, lecture_name)
         rows = self.connection.execute(
-            """SELECT question, answer, sources_json, created_at
-               FROM class_chat_messages WHERE class_name=? ORDER BY id DESC LIMIT ?""",
-            (class_name, limit),
+            f"""SELECT id, question, answer, sources_json, created_at
+                FROM class_chat_messages WHERE {clause} ORDER BY id DESC LIMIT ?""",
+            [*parameters, limit],
         ).fetchall()
         history = []
         for row in reversed(rows):
             history.append({
+                "id": row["id"],
                 "question": row["question"],
                 "answer": row["answer"],
                 "sources": json.loads(row["sources_json"]),
                 "created_at": row["created_at"],
             })
         return history
+
+    def clear_class_chat(
+        self, class_name: str, agent_id: int | None = None, lecture_name: str | None = None,
+    ) -> None:
+        clause, parameters = self._chat_filter(class_name, agent_id, lecture_name)
+        with self.connection:
+            self.connection.execute(f"DELETE FROM class_chat_messages WHERE {clause}", parameters)
+
+    def delete_chats(self, chat_ids: list[int]) -> None:
+        with self.connection:
+            self.connection.executemany("DELETE FROM class_chat_messages WHERE id=?", [(i,) for i in chat_ids])
 
     def close(self) -> None:
         self.connection.close()

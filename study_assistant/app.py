@@ -1,573 +1,162 @@
-"""Desktop interface for searching and inspecting lecture PDFs."""
+"""Cortex — an offline, Ollama-powered chat interface for studying your lecture notes."""
 
 from __future__ import annotations
 
-import os
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QKeySequence, QPixmap
+from PySide6.QtCore import QSettings, Qt, QThread, QTime, QTimer, Signal
+from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
-    QComboBox,
     QDialog,
-    QDialogButtonBox,
-    QFrame,
     QFileDialog,
-    QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
-    QRadioButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
-    QSplitter,
+    QStackedWidget,
+    QTabWidget,
+    QTextBrowser,
     QTreeWidget,
     QTreeWidgetItem,
-    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
-from .credentials import delete_api_key, get_api_key, save_api_key
-from .gemini import EMBEDDING_MODEL, GeminiService
+from .dialogs import (
+    AgentEditorDialog,
+    BatchImportDetailsDialog,
+    ClassHistoryDialog,
+    ImportDetailsDialog,
+    ModelSettingsDialog,
+    QuizRunDialog,
+    QuizSetupDialog,
+    WeakSpotsDialog,
+    _group_lectures,
+)
+from .ollama import (
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_HOST,
+    DEFAULT_VISION_MODEL,
+    OllamaClient,
+    OllamaError,
+    OllamaUnavailable,
+    StudyModels,
+    describe_runtime,
+)
 from .pdf_reader import extract_page_texts, render_page
 from .storage import Library
+from .theme import APP_NAME, APP_TAGLINE, COLORS, creativity_label, stylesheet
+from .widgets import AgentAvatar, AgentCard, ChatMessageWidget, ComposerInput, MeterBar
+
+CONTEXT_WINDOW = 16384
+RETRIEVED_PAGES = 6
 
 
-def _group_lectures(documents: list[dict]) -> list[dict]:
-    """Combine multiple PDF files assigned to the same class/lecture space."""
-    grouped: dict[tuple[str, str], dict] = {}
-    for document in documents:
-        key = (document["class_name"], document["lecture_name"])
-        lecture = grouped.setdefault(key, {"class_name": key[0], "lecture_name": key[1], "page_count": 0})
-        lecture["page_count"] += document["page_count"]
-    return sorted(
-        grouped.values(),
-        key=lambda item: (item["class_name"].casefold(), item["lecture_name"].casefold()),
-    )
+# ---------------------------------------------------------------------------------------------
+# Background work
+# ---------------------------------------------------------------------------------------------
 
+class TaskReporter:
+    """Passed to background actions: call it for status text, or use token/think/event."""
 
-class ImportDetailsDialog(QDialog):
-    def __init__(self, filename: str, parent: QWidget | None = None, default_class_name: str = "") -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Add lecture PDF")
-        self.class_name = QLineEdit()
-        self.class_name.setText(default_class_name)
-        self.class_name.setPlaceholderText("e.g. CS 354")
-        self.lecture_name = QLineEdit(Path(filename).stem)
-        self.lecture_name.setPlaceholderText("e.g. Scheduling")
-        form = QFormLayout()
-        form.addRow("Class", self.class_name)
-        form.addRow("Lecture", self.lecture_name)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(buttons)
+    def __init__(self, task: "BackgroundTask") -> None:
+        self._task = task
 
+    def __call__(self, message: str) -> None:
+        self._task.progress.emit(message)
 
-class ApiKeyDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Gemini API settings")
-        self.key_input = QLineEdit()
-        self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_input.setPlaceholderText("Paste your Gemini API key")
-        existing = get_api_key()
-        if existing:
-            self.key_input.setText(existing)
-        note = QLabel(
-            "The key is normally stored in macOS Keychain. GEMINI_API_KEY, when set, takes precedence. "
-            "Semantic search sends your query to Gemini. "
-            "Indexing (including automatic visual-note reading), grounded Q&A, and quiz creation/grading send relevant "
-            "PDF page text and/or rendered images. Use an unbilled free-tier project to avoid API charges."
-        )
-        note.setWordWrap(True)
-        form = QFormLayout()
-        form.addRow("API key", self.key_input)
-        buttons = QDialogButtonBox()
-        save_button = buttons.addButton("Save to Keychain", QDialogButtonBox.ButtonRole.AcceptRole)
-        clear_button = buttons.addButton("Remove saved key", QDialogButtonBox.ButtonRole.DestructiveRole)
-        cancel_button = buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
-        save_button.clicked.connect(self.save)
-        clear_button.clicked.connect(self.clear)
-        cancel_button.clicked.connect(self.reject)
-        layout = QVBoxLayout(self)
-        layout.addWidget(note)
-        layout.addLayout(form)
-        layout.addWidget(buttons)
+    def token(self, text: str) -> None:
+        self._task.chunk.emit(text)
 
-    def save(self) -> None:
-        value = self.key_input.text().strip()
-        if not value:
-            QMessageBox.warning(self, "API key needed", "Paste a Gemini API key or choose Remove saved key.")
-            return
-        try:
-            persisted = save_api_key(value)
-        except Exception as error:
-            QMessageBox.critical(self, "Could not save key", str(error))
-            return
-        if not persisted:
-            QMessageBox.information(
-                self,
-                "Keychain unavailable",
-                "The key will work until you quit this app. To keep it between launches, set GEMINI_API_KEY before starting the app.",
-            )
-        elif os.environ.get("GEMINI_API_KEY") and os.environ["GEMINI_API_KEY"] != value:
-            QMessageBox.information(
-                self,
-                "Environment key is active",
-                "The Keychain key was saved, but GEMINI_API_KEY is set to a different key and remains active until the app is restarted or that environment variable is changed.",
-            )
-        self.accept()
+    def think(self, text: str) -> None:
+        self._task.thinking.emit(text)
 
-    def clear(self) -> None:
-        try:
-            delete_api_key()
-        except Exception as error:
-            QMessageBox.critical(self, "Could not remove key", str(error))
-            return
-        self.key_input.clear()
-        if os.environ.get("GEMINI_API_KEY"):
-            QMessageBox.information(
-                self,
-                "Environment key remains active",
-                "The saved Keychain key was removed, but GEMINI_API_KEY is still set and remains active.",
-            )
-        self.accept()
+    def event(self, payload: dict) -> None:
+        self._task.event.emit(payload)
 
 
 class BackgroundTask(QThread):
     progress = Signal(str)
+    chunk = Signal(str)
+    thinking = Signal(str)
+    event = Signal(object)
 
-    def __init__(self, action: Callable[[Callable[[str], None]], object]) -> None:
+    def __init__(self, action: Callable[[TaskReporter], object]) -> None:
         super().__init__()
         self.action = action
         self.result: object | None = None
         self.error: str | None = None
+        self.exception: Exception | None = None
 
     def run(self) -> None:
         try:
-            self.result = self.action(self.progress.emit)
-        except Exception as error:  # API/SQLite errors are shown in the app rather than killing the UI.
+            self.result = self.action(TaskReporter(self))
+        except Exception as error:  # shown in the app rather than killing the UI
+            self.exception = error
             self.error = str(error)
 
 
-class ChatMessageWidget(QFrame):
-    """A readable chat bubble with source links and optional follow-up actions."""
+class OllamaMonitor(QThread):
+    """Polls the local Ollama server so the UI can show online state, models, and GPU use."""
 
-    source_opened = Signal(object)
-    explain_selected = Signal(str)
+    status = Signal(object)
 
-    def __init__(
-        self,
-        role: str,
-        text: str,
-        sources: list[dict] | None = None,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.role = role
-        self.text = text
-        self.sources = sources or []
-        self.setObjectName("assistantMessage" if role == "assistant" else "userMessage")
-        self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+    def __init__(self, host: str, interval: float = 4.0) -> None:
+        super().__init__()
+        self.host = host
+        self.interval = interval
+        self._stop = False
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(8)
-        heading = QLabel("Study assistant" if role == "assistant" else "You")
-        heading.setObjectName("messageHeading")
-        layout.addWidget(heading, 0, Qt.AlignmentFlag.AlignLeft)
+    def stop(self) -> None:
+        self._stop = True
 
-        self.body = QLabel(text)
-        self.body.setTextFormat(Qt.TextFormat.PlainText)
-        self.body.setWordWrap(True)
-        self.body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        self.body.setStyleSheet("background: transparent; border: none; padding: 0;")
-        layout.addWidget(self.body)
-
-        self.source_buttons: list[QPushButton] = []
-        if self.sources:
-            source_heading = QLabel("Sources — select a page to preview it")
-            source_heading.setObjectName("sourceHeading")
-            layout.addWidget(source_heading)
-            for source in self.sources:
-                button = QPushButton(self._source_label(source))
-                button.setObjectName("sourceLink")
-                button.setCursor(Qt.CursorShape.PointingHandCursor)
-                button.setToolTip("Open this cited PDF page")
-                button.clicked.connect(lambda _checked=False, page=source: self.source_opened.emit(page))
-                self.source_buttons.append(button)
-                layout.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
-
-        if role == "assistant" and self.sources:
-            actions = QHBoxLayout()
-            copy_button = QPushButton("Copy cited prompt")
-            copy_button.clicked.connect(self.copy_prompt)
-            explain_button = QPushButton("Explain selected text")
-            explain_button.clicked.connect(self.explain_passage)
-            actions.addWidget(copy_button)
-            actions.addWidget(explain_button)
-            actions.addStretch(1)
-            layout.addLayout(actions)
-
-    def set_available_width(self, width: int) -> None:
-        maximum = max(280, width)
-        self.setMinimumWidth(min(500 if self.role == "assistant" else 300, maximum))
-        self.setMaximumWidth(maximum)
-        for button in self.source_buttons:
-            button.setMaximumWidth(maximum - 32)
-
-    @staticmethod
-    def _source_label(source: dict) -> str:
-        return (
-            f"{source['class_name']} · {source['lecture_name']} · "
-            f"{Path(source['file_path']).name} · p. {source['page_number']}"
-        )
-
-    def copy_prompt(self) -> None:
-        selected = self.body.selectedText().strip()
-        passage = selected or self.text
-        evidence = []
-        for source in self.sources:
-            label = self._source_label(source)
-            text = source.get("text", "").strip()
-            visual = source.get("visual_text", "").strip()
-            evidence.append(f"[{label}]\n{text or 'No embedded PDF text; consult the original page.'}")
-            if visual:
-                evidence.append(f"AI-read visual notes (verify against page):\n{visual}")
-        prompt = (
-            "Explain the selected passage more deeply using only the course evidence below. "
-            "Cite each factual claim with its class, lecture, PDF file, and page. If the evidence "
-            "does not support a claim, say so instead of guessing.\n\n"
-            f"Passage to explain:\n{passage}\n\nCourse evidence:\n" + "\n\n".join(evidence)
-        )
-        QApplication.clipboard().setText(prompt)
-        QMessageBox.information(self, "Copied", "A deeper-explanation prompt with cited evidence is on your clipboard.")
-
-    def explain_passage(self) -> None:
-        selected = self.body.selectedText().strip()
-        if not selected:
-            QMessageBox.information(self, "Select some text", "Highlight part of the answer first, then choose Explain selected text.")
-            return
-        self.explain_selected.emit(selected)
+    def run(self) -> None:
+        while not self._stop:
+            client = OllamaClient(self.host)
+            try:
+                models = client.list_models(timeout=2)
+                running = client.running_models(timeout=2)
+                self.status.emit({"online": True, "models": models, "running": running})
+            except OllamaError as error:
+                self.status.emit({"online": False, "models": [], "running": [], "error": str(error)})
+            waited = 0.0
+            while waited < self.interval and not self._stop:
+                time.sleep(0.1)
+                waited += 0.1
 
 
-class QuizSetupDialog(QDialog):
-    def __init__(self, documents: list[dict], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Build a practice quiz")
-        self.resize(620, 540)
-        self.documents = _group_lectures(documents)
-        self.class_filter = QComboBox()
-        self.class_filter.addItem("All classes", None)
-        for class_name in sorted({doc["class_name"] for doc in documents}, key=str.casefold):
-            self.class_filter.addItem(class_name, class_name)
-        self.class_filter.currentIndexChanged.connect(self.refresh_lectures)
-        self.lecture_list = QListWidget()
-        self.question_count = QSpinBox()
-        self.question_count.setRange(1, 10)
-        self.question_count.setValue(5)
-        self.question_type = QComboBox()
-        self.question_type.addItem("Mixed short answer + multiple choice", "mixed")
-        self.question_type.addItem("Short answer", "short_answer")
-        self.question_type.addItem("Multiple choice", "multiple_choice")
-        form = QFormLayout()
-        form.addRow("Class", self.class_filter)
-        form.addRow("Question count", self.question_count)
-        form.addRow("Question style", self.question_type)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self._accept_if_valid)
-        buttons.rejected.connect(self.reject)
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Select the lectures to include. Questions will use fresh examples and scenarios, with citations to their source pages."))
-        layout.addLayout(form)
-        layout.addWidget(QLabel("Lectures"))
-        layout.addWidget(self.lecture_list, 1)
-        layout.addWidget(buttons)
-        self.refresh_lectures()
+# ---------------------------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------------------------
 
-    @property
-    def scopes(self) -> list[tuple[str, str]]:
-        selected = []
-        for index in range(self.lecture_list.count()):
-            item = self.lecture_list.item(index)
-            if item.checkState() == Qt.CheckState.Checked:
-                selected.append(tuple(item.data(Qt.ItemDataRole.UserRole)))
-        return selected
-
-    def refresh_lectures(self) -> None:
-        self.lecture_list.clear()
-        class_name = self.class_filter.currentData()
-        for doc in self.documents:
-            if class_name is not None and doc["class_name"] != class_name:
-                continue
-            item = QListWidgetItem(f"{doc['class_name']} · {doc['lecture_name']} ({doc['page_count']} pages)")
-            item.setData(Qt.ItemDataRole.UserRole, (doc["class_name"], doc["lecture_name"]))
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
-            self.lecture_list.addItem(item)
-
-    def _accept_if_valid(self) -> None:
-        if not self.scopes:
-            QMessageBox.information(self, "Choose lectures", "Select at least one lecture to quiz.")
-            return
-        self.accept()
-
-
-class QuizRunDialog(QDialog):
-    answer_submitted = Signal(object, str)
-
-    def __init__(self, questions: list[dict], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.questions = questions
-        self.question_index = 0
-        self.grading = False
-        self.setWindowTitle("Practice quiz")
-        self.resize(760, 680)
-        self.progress_label = QLabel()
-        self.prompt_label = QLabel()
-        self.prompt_label.setWordWrap(True)
-        self.sources_label = QLabel()
-        self.sources_label.setWordWrap(True)
-        self.input_layout = QVBoxLayout()
-        self.input_host = QWidget()
-        self.input_host.setLayout(self.input_layout)
-        self.feedback = QLabel()
-        self.feedback.setWordWrap(True)
-        self.feedback.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.submit_button = QPushButton("Check answer")
-        self.submit_button.clicked.connect(self.submit_answer)
-        self.next_button = QPushButton("Next question")
-        self.next_button.clicked.connect(self.next_question)
-        self.next_button.hide()
-        self.cancel_button = QPushButton("Close quiz")
-        self.cancel_button.clicked.connect(self.reject)
-        controls = QHBoxLayout()
-        controls.addWidget(self.submit_button)
-        controls.addWidget(self.next_button)
-        controls.addStretch(1)
-        controls.addWidget(self.cancel_button)
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.progress_label)
-        layout.addWidget(self.prompt_label)
-        layout.addWidget(QLabel("Source pages:"))
-        layout.addWidget(self.sources_label)
-        layout.addWidget(self.input_host, 1)
-        layout.addWidget(self.feedback)
-        layout.addLayout(controls)
-        self._load_question()
-
-    def _load_question(self) -> None:
-        self.question = self.questions[self.question_index]
-        self.progress_label.setText(f"Question {self.question_index + 1} of {len(self.questions)} · {self.question['question_type'].replace('_', ' ').title()}")
-        self.prompt_label.setText(self.question["prompt"])
-        labels = []
-        for source_id in self.question["source_ids"]:
-            source = self.question["source_map"][source_id]
-            labels.append(f"{source['class_name']} · {source['lecture_name']} · {Path(source['file_path']).name} · p. {source['page_number']}")
-        self.sources_label.setText("\n".join(labels))
-        while self.input_layout.count():
-            child = self.input_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-        self.answer_input = None
-        self.answer_group = None
-        if self.question["question_type"] == "multiple_choice":
-            self.answer_group = QButtonGroup(self)
-            for index, option in enumerate(self.question["options"]):
-                button = QRadioButton(f"{chr(65 + index)}. {option}")
-                self.answer_group.addButton(button, index)
-                self.input_layout.addWidget(button)
-        else:
-            self.answer_input = QPlainTextEdit()
-            self.answer_input.setPlaceholderText("Explain your reasoning in your own words…")
-            self.input_layout.addWidget(self.answer_input)
-        self.feedback.clear()
-        self.submit_button.setEnabled(True)
-        self.submit_button.show()
-        self.next_button.hide()
-
-    def submit_answer(self) -> None:
-        if self.answer_group:
-            choice = self.answer_group.checkedId()
-            if choice < 0:
-                QMessageBox.information(self, "Choose an option", "Select an answer first.")
-                return
-            answer = chr(65 + choice)
-        else:
-            answer = self.answer_input.toPlainText().strip()
-            if not answer:
-                QMessageBox.information(self, "Write an answer", "Write a short answer first.")
-                return
-        self.submit_button.setEnabled(False)
-        self.answer_submitted.emit(self.question, answer)
-
-    def show_grade(self, result: dict) -> None:
-        self.grading = False
-        self.cancel_button.setEnabled(True)
-        correct_label = "Correct" if result["is_correct"] else "Needs review"
-        expected = self.question["correct_answer"]
-        if self.question["question_type"] == "multiple_choice" and expected in {"A", "B", "C", "D"}:
-            option_index = ord(expected) - ord("A")
-            expected = f"{expected}. {self.question['options'][option_index]}"
-        self.feedback.setText(
-            f"{correct_label} · {result['score']:.0%}\n\n{result['feedback']}\n\n"
-            f"Expected answer: {expected}\n\n"
-            f"Why: {self.question['explanation']} {result['explanation_citations']}"
-        )
-        self.submit_button.hide()
-        self.next_button.setText("Finish quiz" if self.question_index + 1 == len(self.questions) else "Next question")
-        self.next_button.show()
-
-    def set_grading(self, grading: bool) -> None:
-        self.grading = grading
-        self.cancel_button.setEnabled(not grading)
-
-    def grading_failed(self, error: str = "") -> None:
-        self.set_grading(False)
-        self.submit_button.setEnabled(True)
-        detail = f"\n\n{error}" if error else " Check the error message and try grading it again."
-        self.feedback.setText("Your answer was not recorded. Grading failed." + detail)
-
-    def reject(self) -> None:
-        if not self.grading:
-            super().reject()
-
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt method name
-        if self.grading:
-            event.ignore()
-        else:
-            super().closeEvent(event)
-
-    def next_question(self) -> None:
-        self.question_index += 1
-        if self.question_index >= len(self.questions):
-            self.accept()
-            return
-        self._load_question()
-
-
-class WeakSpotsDialog(QDialog):
-    review_requested = Signal(str)
-
-    def __init__(self, performance: list[dict], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.performance = performance
-        self.setWindowTitle("Topics to review")
-        self.resize(620, 500)
-        self.topics = QListWidget()
-        self.topics.currentItemChanged.connect(self.show_topic)
-        self.detail = QLabel("Repeated misses rise to the top. Later successful attempts reduce a topic's weakness score.")
-        self.detail.setWordWrap(True)
-        self.review_button = QPushButton("Create a targeted review quiz")
-        self.review_button.clicked.connect(self.review_topic)
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.accept)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self.review_button)
-        buttons.addStretch(1)
-        buttons.addWidget(close_button)
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Weak topics are ranked by recency-weighted accuracy."))
-        layout.addWidget(self.topics, 1)
-        layout.addWidget(self.detail)
-        layout.addLayout(buttons)
-        if not performance:
-            self.topics.addItem("No quiz attempts yet. Complete a quiz to start tracking topics.")
-            self.review_button.setEnabled(False)
-        else:
-            for entry in performance:
-                item = QListWidgetItem(
-                    f"{entry['topic']} · {entry['accuracy']:.0%} accuracy · "
-                    f"{entry['attempts']} attempts · {entry['misses']} misses"
-                )
-                item.setData(Qt.ItemDataRole.UserRole, entry)
-                self.topics.addItem(item)
-            self.topics.setCurrentRow(0)
-
-    def show_topic(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
-        if not current or not current.data(Qt.ItemDataRole.UserRole):
-            return
-        entry = current.data(Qt.ItemDataRole.UserRole)
-        self.detail.setText(
-            f"{entry['topic']}: recent answers average {entry['accuracy']:.0%}. "
-            f"Missed {entry['misses']} of {entry['attempts']} attempts; last reviewed {entry['last_attempt']}."
-        )
-
-    def review_topic(self) -> None:
-        current = self.topics.currentItem()
-        if current and current.data(Qt.ItemDataRole.UserRole):
-            self.review_requested.emit(current.data(Qt.ItemDataRole.UserRole)["topic"])
-            self.accept()
-
-
-class ClassHistoryDialog(QDialog):
-    source_opened = Signal(object)
-
-    def __init__(self, class_name: str, history: list[dict], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(f"{class_name} · question history")
-        self.resize(760, 560)
-        self.history = history
-        self.entries = QListWidget()
-        self.entries.currentRowChanged.connect(self.show_entry)
-        for entry in history:
-            self.entries.addItem(f"{entry['created_at']} · {entry['question']}")
-        self.detail = QTextBrowser()
-        self.sources = QListWidget()
-        self.sources.itemClicked.connect(lambda item: self.source_opened.emit(item.data(Qt.ItemDataRole.UserRole)))
-        split = QSplitter()
-        detail_panel = QWidget()
-        detail_layout = QVBoxLayout(detail_panel)
-        detail_layout.addWidget(self.detail, 2)
-        detail_layout.addWidget(QLabel("Cited pages — select one to preview"))
-        detail_layout.addWidget(self.sources, 1)
-        split.addWidget(self.entries)
-        split.addWidget(detail_panel)
-        layout = QVBoxLayout(self)
-        layout.addWidget(split)
-        if history:
-            self.entries.setCurrentRow(0)
-
-    def show_entry(self, index: int) -> None:
-        self.sources.clear()
-        if not 0 <= index < len(self.history):
-            self.detail.clear()
-            return
-        entry = self.history[index]
-        self.detail.setPlainText(f"You: {entry['question']}\n\nAssistant: {entry['answer']}")
-        for source in entry["sources"]:
-            label = (
-                f"{source['class_name']} · {source['lecture_name']} · "
-                f"{Path(source['file_path']).name} · p. {source['page_number']}"
-            )
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, source)
-            self.sources.addItem(item)
+def _mono_label(text: str, name: str = "monoMuted") -> QLabel:
+    label = QLabel(text)
+    label.setObjectName(name)
+    return label
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, library: Library | None = None, settings: QSettings | None = None) -> None:
+    def __init__(
+        self,
+        library: Library | None = None,
+        settings: QSettings | None = None,
+        start_monitor: bool = True,
+    ) -> None:
         super().__init__()
-        self.setWindowTitle("Purdue Study Assistant")
-        self.resize(1420, 900)
+        self.setWindowTitle(APP_NAME)
+        self.resize(1440, 900)
+        self.setMinimumSize(980, 600)
         self.library = library or Library()
         self.settings = settings or QSettings("Purdue", "StudyAssistant")
         self.active_task: BackgroundTask | None = None
@@ -577,93 +166,265 @@ class MainWindow(QMainWindow):
         self.current_result: dict | None = None
         self.current_scope: tuple[str | None, str | None] = (None, None)
         self.message_widgets: list[ChatMessageWidget] = []
-        self._conversation_cache: dict[
-            tuple[str | None, str | None], list[tuple[str, str, list[dict]]]
-        ] = {}
+        self._conversation_cache: dict[tuple, list[dict]] = {}
+        self._streaming_message: ChatMessageWidget | None = None
+        self._pending_tokens: list[str] = []
+        self.ollama_online: bool | None = None
+        self.installed_models: list[str] = []
+        self.running_models: list[dict] = []
+        self.monitor: OllamaMonitor | None = None
 
-        self.navigator = QTreeWidget()
-        self.navigator.setObjectName("courseNavigator")
-        self.navigator.setHeaderLabel("Classes and lectures")
-        self.navigator.setMinimumWidth(210)
-        self.navigator.currentItemChanged.connect(self.change_scope)
+        agents = self.library.agents()
+        saved_agent = self.settings.value("agents/current", 0, type=int)
+        self.current_agent = next((a for a in agents if a["id"] == saved_agent), agents[0])
 
-        self.import_button = QPushButton("＋  Add lecture PDFs")
-        self.import_button.setObjectName("primaryAction")
-        self.import_button.setShortcut(QKeySequence.StandardKey.Open)
-        self.import_button.setToolTip("Add a lecture PDF (Command+O on macOS)")
-        self.import_button.clicked.connect(self.import_pdf)
-        self.index_button = QPushButton("Index PDFs for AI search")
-        self.index_button.setToolTip(
-            "Read handwriting and diagrams from page images, then create searchable page embeddings. "
-            "Page text and images are sent to Gemini."
+        self._build_sidebar()
+        self._build_center()
+        self._build_right_panel()
+
+        root = QWidget()
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self.sidebar_scroll)
+        root_layout.addWidget(self.center_panel, 1)
+        root_layout.addWidget(self.right_panel)
+        self.setCentralWidget(root)
+
+        self.task_controls = [
+            self.navigator, self.query, self.ask_mode_button, self.find_mode_button, self.semantic_search,
+            self.send_button, self.import_button, self.index_button, self.quiz_button, self.weak_spots_button,
+            self.history_button, self.new_agent_button, self.config_button, self.clear_button,
+            self.models_button, self.agent_host,
+        ]
+
+        self._token_timer = QTimer(self)
+        self._token_timer.setInterval(45)
+        self._token_timer.timeout.connect(self._flush_tokens)
+        self._clock = QTimer(self)
+        self._clock.timeout.connect(lambda: self.clock_label.setText(QTime.currentTime().toString("HH:mm:ss")))
+        self._clock.start(1000)
+        self.clock_label.setText(QTime.currentTime().toString("HH:mm:ss"))
+
+        self.refresh_agents()
+        self._apply_agent_to_ui()
+        saved_class = self.settings.value("study_space/class", "", type=str).strip()
+        saved_lecture = self.settings.value("study_space/lecture", "", type=str).strip()
+        self.refresh_navigation((saved_class or None, saved_lecture or None))
+        if not self.message_widgets:
+            self._begin_conversation()
+        self.set_mode("ask")
+        self._set_online_status(None)
+        if start_monitor:
+            self._start_monitor()
+        QShortcut(QKeySequence("Ctrl+K"), self, activated=lambda: self.query.setFocus())
+
+    # -- settings ------------------------------------------------------------------------------
+    def model_settings(self) -> dict:
+        return {
+            "host": self.settings.value("models/host", DEFAULT_HOST, type=str) or DEFAULT_HOST,
+            "chat_model": self.settings.value("models/chat", DEFAULT_CHAT_MODEL, type=str) or DEFAULT_CHAT_MODEL,
+            "embedding_model": self.settings.value("models/embedding", DEFAULT_EMBEDDING_MODEL, type=str)
+            or DEFAULT_EMBEDDING_MODEL,
+            "vision_model": self.settings.value("models/vision", DEFAULT_VISION_MODEL, type=str),
+        }
+
+    def _models(self) -> StudyModels:
+        values = self.model_settings()
+        return StudyModels(
+            OllamaClient(values["host"]),
+            chat_model=values["chat_model"],
+            embedding_model=values["embedding_model"],
+            vision_model=values["vision_model"] or None,
         )
-        self.index_button.clicked.connect(self.index_library)
-        self.key_button = QPushButton("AI settings…")
-        self.key_button.clicked.connect(self.configure_api_key)
-        self.dark_mode_toggle = QCheckBox("Dark mode")
-        self.dark_mode_toggle.setObjectName("darkModeToggle")
-        self.dark_mode_toggle.setChecked(self.settings.value("appearance/dark_mode", False, type=bool))
-        self.dark_mode_toggle.toggled.connect(self.set_dark_mode)
-        self.quiz_button = QPushButton("Practice quiz…")
-        self.quiz_button.clicked.connect(self.start_quiz)
-        self.weak_spots_button = QPushButton("Weak spots")
-        self.weak_spots_button.clicked.connect(self.open_weak_spots)
-        self.history_button = QPushButton("Question history")
-        self.history_button.clicked.connect(self.open_class_history)
-        self.api_status = QLabel()
-        self.api_status.setWordWrap(True)
-        self.api_status.setObjectName("mutedText")
-        self.library_status = QLabel()
-        self.library_status.setWordWrap(True)
-        self.library_status.setObjectName("mutedText")
-        self.library_status.setToolTip(
-            "AI indexing also checks page images for handwriting and diagram labels."
-        )
 
+    def agent_model(self, agent: dict | None = None) -> str:
+        agent = agent or self.current_agent
+        return agent.get("model") or self.model_settings()["chat_model"]
+
+    # -- layout: sidebar -------------------------------------------------------------------------
+    def _build_sidebar(self) -> None:
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setMinimumWidth(230)
-        sidebar.setMaximumWidth(320)
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(16, 18, 16, 16)
-        sidebar_layout.setSpacing(10)
-        brand = QLabel("Purdue Study Assistant")
-        brand.setObjectName("brandTitle")
-        sidebar_layout.addWidget(brand)
-        sidebar_layout.addWidget(QLabel("Your course material, one conversation at a time."))
-        sidebar_layout.addSpacing(8)
-        sidebar_layout.addWidget(self.import_button)
-        courses_heading = QLabel("YOUR COURSES")
-        courses_heading.setObjectName("sectionHeading")
-        sidebar_layout.addWidget(courses_heading)
-        sidebar_layout.addWidget(self.navigator, 1)
-        tools_heading = QLabel("STUDY TOOLS")
-        tools_heading.setObjectName("sectionHeading")
-        sidebar_layout.addWidget(tools_heading)
-        sidebar_layout.addWidget(self.quiz_button)
-        sidebar_layout.addWidget(self.weak_spots_button)
-        sidebar_layout.addWidget(self.history_button)
-        sidebar_layout.addSpacing(8)
-        sidebar_layout.addWidget(self.library_status)
-        sidebar_layout.addWidget(self.index_button)
-        sidebar_layout.addWidget(self.key_button)
-        sidebar_layout.addWidget(self.dark_mode_toggle)
-        self.api_status.setText(self._key_status())
-        sidebar_layout.addWidget(self.api_status)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(14, 18, 14, 12)
+        layout.setSpacing(8)
 
-        self.scope_title = QLabel("All materials")
-        self.scope_title.setObjectName("workspaceTitle")
-        self.scope_subtitle = QLabel("Ask a question or find a page in your PDFs. Answers cite the source pages they use.")
-        self.scope_subtitle.setObjectName("mutedText")
-        self.preview_toggle = QPushButton("Show page preview")
-        self.preview_toggle.setCheckable(True)
-        self.preview_toggle.toggled.connect(self.toggle_preview)
-        chat_header = QHBoxLayout()
-        title_stack = QVBoxLayout()
-        title_stack.addWidget(self.scope_title)
-        title_stack.addWidget(self.scope_subtitle)
-        chat_header.addLayout(title_stack, 1)
-        chat_header.addWidget(self.preview_toggle)
+        top = QHBoxLayout()
+        rule = QFrame()
+        rule.setObjectName("brandRule")
+        rule.setFixedSize(22, 2)
+        top.addWidget(rule, 0, Qt.AlignmentFlag.AlignVCenter)
+        top.addStretch(1)
+        self.gear_button = QPushButton("✳")
+        self.gear_button.setObjectName("ghostButton")
+        self.gear_button.setToolTip("Local model settings")
+        self.gear_button.clicked.connect(self.configure_models)
+        top.addWidget(self.gear_button)
+        layout.addLayout(top)
+        brand = QLabel(APP_NAME.upper())
+        brand.setObjectName("brandTitle")
+        layout.addWidget(brand)
+        layout.addWidget(_mono_label(APP_TAGLINE, "brandTag"))
+        self.online_label = _mono_label("", "onlineStatus")
+        layout.addWidget(self.online_label)
+        layout.addSpacing(12)
+
+        agents_row = QHBoxLayout()
+        agents_row.addWidget(_mono_label("AGENTS", "sectionHeading"))
+        agents_row.addStretch(1)
+        self.new_agent_button = QPushButton("+ NEW")
+        self.new_agent_button.clicked.connect(self.create_agent)
+        agents_row.addWidget(self.new_agent_button)
+        layout.addLayout(agents_row)
+        self.agent_host = QWidget()
+        self.agent_list = QVBoxLayout(self.agent_host)
+        self.agent_list.setContentsMargins(0, 0, 0, 0)
+        self.agent_list.setSpacing(4)
+        layout.addWidget(self.agent_host)
+        self.agent_cards: list[AgentCard] = []
+        layout.addSpacing(8)
+
+        # Courses tab
+        self.navigator = QTreeWidget()
+        self.navigator.setObjectName("courseNavigator")
+        self.navigator.setHeaderHidden(True)
+        self.navigator.setMinimumHeight(170)
+        self.navigator.setIndentation(14)
+        self.navigator.currentItemChanged.connect(self.change_scope)
+        self.import_button = QPushButton("+ ADD LECTURE PDFS")
+        self.import_button.setShortcut(QKeySequence.StandardKey.Open)
+        self.import_button.setToolTip("Add lecture PDFs (Command+O)")
+        self.import_button.clicked.connect(self.import_pdf)
+        self.library_status = _mono_label("", "monoMuted")
+        self.library_status.setWordWrap(True)
+        self.index_button = QPushButton("⟳ INDEX FOR SEARCH")
+        self.index_button.setToolTip(
+            "Embed every page with your local embedding model (and read handwriting if a vision model is set). "
+            "Nothing leaves this Mac."
+        )
+        self.index_button.clicked.connect(self.index_library)
+        courses = QWidget()
+        courses_layout = QVBoxLayout(courses)
+        courses_layout.setContentsMargins(0, 10, 0, 0)
+        courses_layout.setSpacing(8)
+        courses_layout.addWidget(self.import_button)
+        courses_layout.addWidget(self.navigator, 1)
+        courses_layout.addWidget(self.library_status)
+        courses_layout.addWidget(self.index_button)
+
+        # Study tab
+        self.quiz_button = QPushButton("PRACTICE QUIZ…")
+        self.quiz_button.clicked.connect(self.start_quiz)
+        self.weak_spots_button = QPushButton("WEAK SPOTS")
+        self.weak_spots_button.clicked.connect(self.open_weak_spots)
+        self.history_button = QPushButton("QUESTION HISTORY")
+        self.history_button.clicked.connect(self.open_class_history)
+        study = QWidget()
+        study_layout = QVBoxLayout(study)
+        study_layout.setContentsMargins(0, 10, 0, 0)
+        study_layout.setSpacing(8)
+        for button in (self.quiz_button, self.weak_spots_button, self.history_button):
+            study_layout.addWidget(button)
+        study_help = QLabel(
+            "Quizzes are written and graded by your default local model from the lectures you pick. "
+            "Weak spots ranks topics by recent accuracy."
+        )
+        study_help.setObjectName("dialogHelp")
+        study_help.setWordWrap(True)
+        study_layout.addWidget(study_help)
+        study_layout.addStretch(1)
+
+        self.side_tabs = QTabWidget()
+        self.side_tabs.addTab(courses, "COURSES")
+        self.side_tabs.addTab(study, "STUDY")
+        layout.addWidget(self.side_tabs, 1)
+
+        self.models_button = QPushButton("⬡  MODELS")
+        self.models_button.clicked.connect(self.configure_models)
+        layout.addWidget(self.models_button)
+        footer = _mono_label("◆ 100% LOCAL · NO CLOUD", "footerNote")
+        footer.setToolTip(str(self.library.path))
+        layout.addWidget(footer)
+
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setObjectName("sidebarScroll")
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.sidebar_scroll.setFixedWidth(272)
+        self.sidebar_scroll.setWidget(sidebar)
+        sidebar.setMinimumHeight(720)
+        sidebar.setMaximumWidth(272)
+
+    # -- layout: center -----------------------------------------------------------------------
+    def _stat(self, row: QHBoxLayout, label: str) -> QLabel:
+        row.addWidget(_mono_label(label, "statLabel"))
+        value = _mono_label("—", "statValue")
+        row.addWidget(value)
+        row.addSpacing(14)
+        return value
+
+    def _build_center(self) -> None:
+        self.center_panel = QWidget()
+        self.center_panel.setObjectName("centerPanel")
+        center = QVBoxLayout(self.center_panel)
+        center.setContentsMargins(0, 0, 0, 0)
+        center.setSpacing(0)
+
+        header = QFrame()
+        header.setObjectName("header")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(22, 14, 22, 14)
+        header_layout.setSpacing(14)
+        self.header_avatar = AgentAvatar("", "#9b87f5", 50)
+        header_layout.addWidget(self.header_avatar)
+        info = QVBoxLayout()
+        info.setSpacing(5)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(12)
+        self.agent_title = _mono_label("", "agentTitle")
+        title_row.addWidget(self.agent_title)
+        self.scope_title = _mono_label("ALL MATERIALS", "scopeChip")
+        title_row.addWidget(self.scope_title, 0, Qt.AlignmentFlag.AlignVCenter)
+        title_row.addStretch(1)
+        info.addLayout(title_row)
+        row1 = QHBoxLayout()
+        row1.setSpacing(5)
+        self.stat_model = self._stat(row1, "MODEL")
+        self.stat_creativity = self._stat(row1, "CREATIVITY")
+        row1.addWidget(_mono_label("SPEED", "statLabel"))
+        self.stat_speed = _mono_label("—", "statValue")
+        row1.addWidget(self.stat_speed)
+        self.speed_meter = MeterBar(44)
+        row1.addWidget(self.speed_meter, 0, Qt.AlignmentFlag.AlignVCenter)
+        row1.addStretch(1)
+        row2 = QHBoxLayout()
+        row2.setSpacing(5)
+        self.stat_runtime = self._stat(row2, "RUNS ON")
+        row2.addWidget(_mono_label("CONTEXT", "statLabel"))
+        self.stat_context = _mono_label("—", "statValue")
+        row2.addWidget(self.stat_context)
+        self.context_meter = MeterBar(44)
+        row2.addWidget(self.context_meter, 0, Qt.AlignmentFlag.AlignVCenter)
+        row2.addSpacing(14)
+        self.stat_notes = self._stat(row2, "NOTES")
+        row2.addStretch(1)
+        info.addLayout(row1)
+        info.addLayout(row2)
+        header_layout.addLayout(info, 1)
+        self.panel_button = QPushButton("▯ PANEL")
+        self.panel_button.setCheckable(True)
+        self.panel_button.setChecked(True)
+        self.panel_button.toggled.connect(self.toggle_right_panel)
+        self.config_button = QPushButton("⚙ CONFIG")
+        self.config_button.clicked.connect(self.edit_agent)
+        self.clear_button = QPushButton("✕")
+        self.clear_button.setToolTip("Clear this conversation")
+        self.clear_button.clicked.connect(self.clear_conversation)
+        for button in (self.panel_button, self.config_button, self.clear_button):
+            header_layout.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
+        center.addWidget(header)
 
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setObjectName("chatScroll")
@@ -672,278 +433,392 @@ class MainWindow(QMainWindow):
         self.chat_body = QWidget()
         self.chat_body.setObjectName("chatBody")
         self.chat_layout = QVBoxLayout(self.chat_body)
-        self.chat_layout.setContentsMargins(28, 24, 28, 24)
-        self.chat_layout.setSpacing(14)
+        self.chat_layout.setContentsMargins(48, 26, 48, 26)
+        self.chat_layout.setSpacing(22)
         self.chat_layout.addStretch(1)
         self.chat_scroll.setWidget(self.chat_body)
+        center.addWidget(self.chat_scroll, 1)
 
-        self.query = QLineEdit()
-        self.query.setObjectName("composerInput")
-        self.query.setPlaceholderText("Ask something about your lectures…")
-        self.query.returnPressed.connect(self.send_message)
-        self.mode_combo = QComboBox()
-        self.mode_combo.setObjectName("messageMode")
-        self.mode_combo.addItem("Ask from my PDFs", "ask")
-        self.mode_combo.addItem("Find a page", "find")
-        self.mode_combo.currentIndexChanged.connect(self.update_composer_mode)
-        self.semantic_search = QCheckBox("Search by meaning")
-        self.semantic_search.setToolTip("Also use Gemini embeddings to find conceptually related pages.")
-        self.semantic_search.setChecked(False)
-        self.semantic_search.hide()
-        self.send_button = QPushButton("Ask")
+        self.composer = QFrame()
+        self.composer.setObjectName("composer")
+        composer_layout = QVBoxLayout(self.composer)
+        composer_layout.setContentsMargins(14, 10, 12, 10)
+        composer_layout.setSpacing(6)
+        self.query = ComposerInput()
+        self.query.submitted.connect(self.send_message)
+        self.query.focus_changed.connect(self._composer_focus)
+        composer_layout.addWidget(self.query)
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+        self.ask_mode_button = QPushButton("ASK")
+        self.find_mode_button = QPushButton("FIND PAGE")
+        self.mode_group = QButtonGroup(self)
+        for mode, button in (("ask", self.ask_mode_button), ("find", self.find_mode_button)):
+            button.setObjectName("modeButton")
+            button.setCheckable(True)
+            button.clicked.connect(lambda _c=False, m=mode: self.set_mode(m))
+            self.mode_group.addButton(button)
+            controls.addWidget(button)
+        self.semantic_search = QCheckBox("BY MEANING")
+        self.semantic_search.setObjectName("hintText")
+        self.semantic_search.setToolTip("Also rank pages by meaning with your local embedding model.")
+        self.semantic_search.setChecked(True)
+        controls.addWidget(self.semantic_search)
+        controls.addSpacing(8)
+        self.composer_help = _mono_label("ENTER SENDS · SHIFT+ENTER NEW LINE", "hintText")
+        controls.addWidget(self.composer_help)
+        controls.addStretch(1)
+        self.send_button = QPushButton("SEND ▸")
         self.send_button.setObjectName("sendButton")
         self.send_button.clicked.connect(self.send_message)
-        composer_top = QHBoxLayout()
-        composer_top.addWidget(self.mode_combo)
-        composer_top.addWidget(self.semantic_search)
-        composer_top.addStretch(1)
-        composer_row = QHBoxLayout()
-        composer_row.addWidget(self.query, 1)
-        composer_row.addWidget(self.send_button)
-        composer = QFrame()
-        composer.setObjectName("composer")
-        composer_layout = QVBoxLayout(composer)
-        composer_layout.setContentsMargins(14, 10, 14, 10)
-        composer_layout.addLayout(composer_top)
-        composer_layout.addLayout(composer_row)
-        self.composer_help = QLabel()
-        self.composer_help.setObjectName("mutedText")
-        composer_layout.addWidget(self.composer_help)
+        controls.addWidget(self.send_button)
+        composer_layout.addLayout(controls)
+        composer_wrap = QVBoxLayout()
+        composer_wrap.setContentsMargins(32, 8, 32, 18)
+        composer_wrap.addWidget(self.composer)
+        center.addLayout(composer_wrap)
 
-        self.preview_title = QLabel("Choose a citation to inspect its source page")
-        self.preview_title.setObjectName("previewTitle")
+    # -- layout: right panel -------------------------------------------------------------------
+    def _build_right_panel(self) -> None:
+        self.right_panel = QWidget()
+        self.right_panel.setObjectName("rightPanel")
+        self.right_panel.setFixedWidth(330)
+        outer = QVBoxLayout(self.right_panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.right_stack = QStackedWidget()
+        outer.addWidget(self.right_stack)
+
+        link = QWidget()
+        layout = QVBoxLayout(link)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(8)
+        top = QHBoxLayout()
+        top.addWidget(_mono_label("// NEURAL LINK", "panelSubject"))
+        top.addStretch(1)
+        self.clock_label = _mono_label("", "panelSubject")
+        top.addWidget(self.clock_label)
+        layout.addLayout(top)
+        layout.addSpacing(6)
+        self.panel_avatar = AgentAvatar("", "#9b87f5", 270, ring=True)
+        layout.addWidget(self.panel_avatar, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addSpacing(4)
+        self.panel_subject = _mono_label("", "panelSubject")
+        self.panel_name = _mono_label("", "panelName")
+        self.panel_state = _mono_label("◆ IDLE", "monoMuted")
+        for widget in (self.panel_subject, self.panel_name, self.panel_state):
+            widget.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            layout.addWidget(widget)
+        dots = _mono_label("·" * 34, "monoMuted")
+        dots.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(dots)
+        self.panel_prompt = QLabel()
+        self.panel_prompt.setObjectName("panelPrompt")
+        self.panel_prompt.setWordWrap(True)
+        self.panel_prompt.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(self.panel_prompt)
+        layout.addStretch(1)
+        self.right_stack.addWidget(link)
+
+        # Page preview (opened from citations)
+        page = QWidget()
+        self.preview_panel = page
+        preview_layout = QVBoxLayout(page)
+        preview_layout.setContentsMargins(16, 14, 16, 14)
+        preview_layout.setSpacing(8)
+        back = QPushButton("◂ BACK TO LINK")
+        back.setObjectName("ghostButton")
+        back.clicked.connect(lambda: self.right_stack.setCurrentIndex(0))
+        preview_layout.addWidget(back, 0, Qt.AlignmentFlag.AlignLeft)
+        self.preview_title = _mono_label("", "monoMuted")
         self.preview_title.setWordWrap(True)
+        preview_layout.addWidget(self.preview_title)
         self.preview = QLabel("PDF page preview")
         self.preview.setObjectName("pdfPreview")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(300, 360)
-        self.visual_notes_hint = QLabel("Handwriting and visual labels are read automatically when you index PDFs.")
-        self.visual_notes_hint.setObjectName("mutedText")
-        self.visual_notes_hint.setWordWrap(True)
+        self.preview.setMinimumHeight(260)
+        self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        preview_layout.addWidget(self.preview, 3)
         self.excerpt = QTextBrowser()
-        self.excerpt.setPlaceholderText("Extracted text and AI-read visual notes appear here.")
-        self.excerpt.setMinimumHeight(120)
-        self.excerpt.setOpenExternalLinks(False)
-        preview_panel = QWidget()
-        preview_panel.setObjectName("previewPanel")
-        preview_panel.setMinimumWidth(280)
-        preview_panel.setMaximumWidth(440)
-        preview_layout = QVBoxLayout(preview_panel)
-        preview_layout.setContentsMargins(12, 10, 12, 10)
-        preview_layout.addWidget(self.preview_title)
-        preview_layout.addWidget(self.preview, 2)
-        preview_layout.addWidget(self.visual_notes_hint)
-        preview_layout.addWidget(self.excerpt, 1)
-        preview_panel.hide()
+        self.excerpt.setPlaceholderText("Extracted text and machine-read handwriting appear here.")
+        preview_layout.addWidget(self.excerpt, 2)
+        self.right_stack.addWidget(page)
 
-        chat_content = QWidget()
-        chat_content_layout = QVBoxLayout(chat_content)
-        chat_content_layout.setContentsMargins(0, 0, 0, 0)
-        chat_content_layout.setSpacing(10)
-        chat_content_layout.addLayout(chat_header)
-        chat_content_layout.addWidget(self.chat_scroll, 1)
-        chat_content_layout.addWidget(composer)
-        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.content_splitter.addWidget(chat_content)
-        self.content_splitter.addWidget(preview_panel)
-        self.content_splitter.setStretchFactor(0, 1)
-        self.content_splitter.setStretchFactor(1, 0)
-        self.content_splitter.setSizes([1000, 0])
-        self.preview_panel = preview_panel
+    # -- appearance & status ---------------------------------------------------------------------
+    def _apply_agent_to_ui(self) -> None:
+        agent = self.current_agent
+        self.setStyleSheet(stylesheet(agent["accent"]))
+        name = agent["name"]
+        self.agent_title.setText(name.upper())
+        self.header_avatar.set_agent(name, agent["accent"])
+        self.panel_avatar.set_agent(name, agent["accent"])
+        self.panel_name.setText(name.upper())
+        self.panel_subject.setText(f"SUBJECT // ID-{agent['id'] * 7919 % 0xFFFFF:05X}")
+        self.panel_prompt.setText(agent["system_prompt"] or "No system prompt set.")
+        self.stat_model.setText(self.agent_model())
+        temperature = float(agent["temperature"])
+        self.stat_creativity.setText(f"{temperature:.2f} {creativity_label(temperature)}")
+        self.stat_notes.setText({"strict": "STRICT · CITED", "blend": "NOTES + GENERAL", "off": "OFF"}[agent["notes_mode"]])
+        self._update_runtime_stat()
+        for card in self.agent_cards:
+            card.set_active(card.agent_id == agent["id"])
+        if hasattr(self, "find_mode_button"):
+            self.set_mode(self.current_mode())
 
-        workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
-        workspace_splitter.addWidget(sidebar)
-        workspace_splitter.addWidget(self.content_splitter)
-        workspace_splitter.setStretchFactor(0, 0)
-        workspace_splitter.setStretchFactor(1, 1)
-        workspace_splitter.setSizes([260, 1100])
+    def _set_state(self, text: str) -> None:
+        self.panel_state.setText(f"◆ {text}")
+        busy = text not in {"IDLE", "OFFLINE"}
+        self.panel_avatar.set_busy(busy)
 
-        self.task_controls = [
-            self.navigator, self.query, self.mode_combo, self.semantic_search, self.send_button,
-            self.import_button, self.index_button, self.key_button, self.quiz_button,
-            self.weak_spots_button, self.history_button, self.dark_mode_toggle,
-        ]
-        root = QWidget()
-        root_layout = QHBoxLayout(root)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.addWidget(workspace_splitter)
-        self.setCentralWidget(root)
-        self.set_dark_mode(self.dark_mode_toggle.isChecked(), persist=False)
-        saved_class = self.settings.value("study_space/class", "", type=str).strip()
-        saved_lecture = self.settings.value("study_space/lecture", "", type=str).strip()
-        self.refresh_navigation((saved_class or None, saved_lecture or None))
-        self._append_message(
-            "assistant",
-            "Hi! I can help you study from your lecture PDFs. Choose a course on the left, then ask a question or switch to Find a page to locate relevant slides. Every answer is grounded in retrieved pages and includes citations you can open.",
-        )
-        self.update_composer_mode()
-        self.statusBar().showMessage(self._key_status())
+    def _composer_focus(self, focused: bool) -> None:
+        self.composer.setProperty("focused", focused)
+        self.composer.style().unpolish(self.composer)
+        self.composer.style().polish(self.composer)
 
-    def set_dark_mode(self, enabled: bool, persist: bool = True) -> None:
-        """Apply a coordinated light or dark palette and optionally save the preference."""
-        if persist:
-            self.settings.setValue("appearance/dark_mode", enabled)
-        if enabled:
-            colors = {
-                "window": "#171a20", "sidebar": "#1d2129", "surface": "#222731",
-                "raised": "#282e39", "border": "#363e4b", "text": "#e8ebf0",
-                "muted": "#a1a9b7", "accent": "#7aa2f7", "accent_hover": "#91b2fa",
-                "accent_soft": "#293750", "user": "#27364d", "input": "#1c2129",
-                "hover": "#303846", "pressed": "#394457", "preview": "#171a20",
-            }
+    def _start_monitor(self) -> None:
+        if self.monitor:
+            self.monitor.stop()
+            self.monitor.wait(2000)
+        self.monitor = OllamaMonitor(self.model_settings()["host"])
+        self.monitor.status.connect(self._on_ollama_status)
+        self.monitor.start()
+
+    def _on_ollama_status(self, status: dict) -> None:
+        if self.closing:
+            return
+        installed = sorted(model["name"] for model in status["models"])
+        changed = installed != self.installed_models
+        self.installed_models = installed
+        self.running_models = status["running"]
+        self._set_online_status(status["online"])
+        self._update_runtime_stat()
+        if changed and not self.active_task:
+            self.refresh_agents()
+
+    def _set_online_status(self, online: bool | None) -> None:
+        self.ollama_online = online
+        if online is None:
+            self.online_label.setText("◇ CONNECTING TO OLLAMA…")
+            self.online_label.setStyleSheet(f"color: {COLORS['muted']};")
+        elif online:
+            count = len(self.installed_models)
+            self.online_label.setText(f"◆ ONLINE · {count} MODEL{'S' if count != 1 else ''}")
+            self.online_label.setStyleSheet(f"color: {COLORS['ok']};")
+            if self.panel_state.text() == "◆ OFFLINE":
+                self._set_state("IDLE")
         else:
-            colors = {
-                "window": "#f6f7f9", "sidebar": "#eef1f5", "surface": "#ffffff",
-                "raised": "#f8f9fb", "border": "#dce1e8", "text": "#202733",
-                "muted": "#667085", "accent": "#385eaa", "accent_hover": "#2d4f93",
-                "accent_soft": "#f1f5fc", "user": "#edf3fd", "input": "#ffffff",
-                "hover": "#f0f3f8", "pressed": "#e7ebf2", "preview": "#f3f5f8",
-            }
-        c = colors
-        self.setStyleSheet(
-            f"QMainWindow {{ background: {c['window']}; color: {c['text']}; }}"
-            f"QWidget {{ color: {c['text']}; }}"
-            f"#sidebar {{ background: {c['sidebar']}; border-right: 1px solid {c['border']}; }}"
-            f"#brandTitle {{ font-size: 18px; font-weight: 700; color: {c['text']}; }}"
-            f"#workspaceTitle {{ font-size: 22px; font-weight: 650; color: {c['text']}; }}"
-            f"#sectionHeading, #sourceHeading {{ color: {c['muted']}; font-size: 10px; font-weight: 700; }}"
-            f"#mutedText {{ color: {c['muted']}; font-size: 11px; }}"
-            f"#chatScroll, #chatBody {{ background: {c['raised']}; border: none; }}"
-            f"#assistantMessage {{ background: {c['surface']}; border: 1px solid {c['border']}; border-radius: 16px; }}"
-            f"#userMessage {{ background: {c['user']}; border: 1px solid {c['border']}; border-radius: 16px; }}"
-            f"#messageHeading {{ color: {c['text']}; font-weight: 650; }}"
-            f"#composer {{ background: {c['surface']}; border: 1px solid {c['border']}; border-radius: 16px; }}"
-            f"#composerInput {{ background: transparent; color: {c['text']}; border: none; padding: 8px; font-size: 14px; }}"
-            f"#pdfPreview {{ background: {c['preview']}; color: {c['muted']}; border: 1px solid {c['border']}; border-radius: 12px; }}"
-            f"#previewPanel {{ background: {c['surface']}; border-left: 1px solid {c['border']}; }}"
-            f"#courseNavigator, QTextBrowser, QPlainTextEdit, QLineEdit, QComboBox, QListWidget {{"
-            f"background: {c['input']}; color: {c['text']}; border: 1px solid {c['border']}; border-radius: 9px; }}"
-            f"QTreeWidget#courseNavigator, QTreeView#courseNavigator {{ background: {c['input']}; color: {c['text']}; }}"
-            f"QHeaderView::section {{ background: {c['sidebar']}; color: {c['muted']}; border: none; padding: 5px; }}"
-            f"QTreeWidget::item {{ padding: 5px 4px; border-radius: 6px; }}"
-            f"QTreeWidget::item:selected, QListWidget::item:selected {{ background: {c['accent_soft']}; color: {c['text']}; }}"
-            f"QPushButton {{ background: {c['surface']}; color: {c['text']}; border: 1px solid {c['border']};"
-            f" border-radius: 11px; padding: 8px 12px; font-weight: 550; }}"
-            f"QPushButton:hover {{ background: {c['hover']}; border-color: {c['accent']}; }}"
-            f"QPushButton:pressed {{ background: {c['pressed']}; }}"
-            f"QPushButton:disabled {{ color: {c['muted']}; background: {c['sidebar']}; }}"
-            f"#sendButton, #primaryAction {{ background: {c['accent']}; color: #ffffff; border: none;"
-            f" font-weight: 650; padding: 9px 17px; border-radius: 13px; }}"
-            f"#sendButton:hover, #primaryAction:hover {{ background: {c['accent_hover']}; }}"
-            f"#sourceLink {{ color: {c['accent']}; text-align: left; border: 1px solid {c['border']};"
-            f" background: {c['accent_soft']}; padding: 7px 11px; border-radius: 12px; }}"
-            f"#sourceLink:hover {{ border-color: {c['accent']}; }}"
-            f"QCheckBox {{ spacing: 8px; }} QCheckBox::indicator {{ width: 15px; height: 15px; }}"
-            f"QSplitter::handle {{ background: {c['border']}; }}"
-        )
+            self.online_label.setText("◇ OFFLINE · OPEN THE OLLAMA APP")
+            self.online_label.setStyleSheet(f"color: {COLORS['bad']};")
+            if not self.active_task:
+                self._set_state("OFFLINE")
 
-    def _append_message(self, role: str, text: str, sources: list[dict] | None = None) -> ChatMessageWidget:
-        message = ChatMessageWidget(role, text, sources, self.chat_body)
-        message.set_available_width(min(900 if role == "assistant" else 720, max(300, self.chat_scroll.viewport().width() - 64)))
+    def _update_runtime_stat(self) -> None:
+        model = self.agent_model()
+        runtime = describe_runtime(self.running_models, model)
+        if runtime["loaded"]:
+            self.stat_runtime.setText(f"{runtime['where']} · {runtime['memory_gb']:.1f} GB")
+        elif self.installed_models and model not in self.installed_models and f"{model}:latest" not in self.installed_models:
+            self.stat_runtime.setText("NOT INSTALLED")
+        else:
+            self.stat_runtime.setText("LOADS ON FIRST USE" if self.ollama_online else "—")
+
+    # -- agents ------------------------------------------------------------------------------
+    def refresh_agents(self) -> None:
+        for card in self.agent_cards:
+            self.agent_list.removeWidget(card)
+            card.deleteLater()
+        self.agent_cards = []
+        for agent in self.library.agents():
+            card = AgentCard(agent, self.agent_model(agent))
+            card.clicked.connect(self.select_agent)
+            card.set_active(agent["id"] == self.current_agent["id"])
+            self.agent_list.addWidget(card)
+            self.agent_cards.append(card)
+
+    def _conversation_key(self) -> tuple:
+        return (self.current_agent["id"], self.current_scope)
+
+    def _cache_conversation(self) -> None:
+        if self.message_widgets:
+            self._conversation_cache[self._conversation_key()] = [
+                {"role": m.role, "text": m.text, "sources": m.sources, "kind": getattr(m, "kind", "chat")}
+                for m in self.message_widgets
+            ]
+
+    def select_agent(self, agent_id: int) -> None:
+        if agent_id == self.current_agent["id"] or self.active_task:
+            return
+        agent = self.library.agent(agent_id)
+        if not agent:
+            return
+        self._cache_conversation()
+        self._clear_chat()
+        self.current_agent = agent
+        self.settings.setValue("agents/current", agent_id)
+        self._apply_agent_to_ui()
+        self._begin_conversation()
+
+    def create_agent(self) -> None:
+        dialog = AgentEditorDialog(None, self.installed_models, self.model_settings()["chat_model"], self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            agent_id = self.library.save_agent(dialog.agent_data())
+            self.refresh_agents()
+            self.select_agent(agent_id)
+
+    def edit_agent(self) -> None:
+        can_delete = len(self.library.agents()) > 1
+        dialog = AgentEditorDialog(
+            self.current_agent, self.installed_models, self.model_settings()["chat_model"], self, can_delete
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.deleted:
+            deleted_id = self.current_agent["id"]
+            self.library.delete_agent(deleted_id)
+            for key in [k for k in self._conversation_cache if k[0] == deleted_id]:
+                del self._conversation_cache[key]
+            self._clear_chat()
+            self.current_agent = self.library.agents()[0]
+            self.settings.setValue("agents/current", self.current_agent["id"])
+            self.refresh_agents()
+            self._apply_agent_to_ui()
+            self._begin_conversation()
+            return
+        self.library.save_agent(dialog.agent_data())
+        self.current_agent = self.library.agent(self.current_agent["id"])
+        self.refresh_agents()
+        self._apply_agent_to_ui()
+
+    def configure_models(self) -> None:
+        dialog = ModelSettingsDialog(self.model_settings(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        self.settings.setValue("models/host", values["host"] or DEFAULT_HOST)
+        self.settings.setValue("models/chat", values["chat_model"])
+        self.settings.setValue("models/embedding", values["embedding_model"])
+        self.settings.setValue("models/vision", values["vision_model"])
+        self.refresh_agents()
+        self._apply_agent_to_ui()
+        self.update_library_status()
+        if self.monitor:
+            self._start_monitor()
+
+    # -- chat plumbing ---------------------------------------------------------------------------
+    def _append_message(
+        self, role: str, text: str, sources: list[dict] | None = None, *,
+        kind: str = "chat", retrieval: str = "", streaming: bool = False,
+    ) -> ChatMessageWidget:
+        agent = self.current_agent
+        message = ChatMessageWidget(
+            role, text, sources, self.chat_body, agent_name=agent["name"], accent=agent["accent"],
+            retrieval=retrieval, streaming=streaming,
+        )
+        message.kind = kind
+        if role == "assistant" and kind == "intro":
+            message.action_host.hide()
+        elif role == "assistant" and kind in {"search", "error"}:
+            message.action_buttons["regenerate"].hide()
+            message.action_buttons["explain"].hide()
         message.source_opened.connect(self.open_source_page)
-        message.explain_selected.connect(lambda passage, refs=message.sources: self.explain_more(passage, refs))
-        alignment = Qt.AlignmentFlag.AlignRight if role == "user" else Qt.AlignmentFlag.AlignLeft
-        self.chat_layout.insertWidget(self.chat_layout.count() - 1, message, 0, alignment)
+        message.explain_selected.connect(lambda passage, m=message: self.explain_more(passage, m.sources))
+        message.regenerate_requested.connect(lambda m=message: self.regenerate(m))
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, message)
         self.message_widgets.append(message)
         QTimer.singleShot(0, self._refresh_message_layout)
-        QTimer.singleShot(0, lambda: self.chat_scroll.verticalScrollBar().setValue(
-            self.chat_scroll.verticalScrollBar().maximum()
-        ))
+        QTimer.singleShot(0, self._scroll_to_bottom)
         return message
+
+    def _scroll_to_bottom(self) -> None:
+        bar = self.chat_scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def _clear_chat(self) -> None:
         for message in self.message_widgets:
             self.chat_layout.removeWidget(message)
+            message.hide()
             message.deleteLater()
         self.message_widgets.clear()
 
-    def _begin_scope_conversation(self, scope: tuple[str | None, str | None]) -> None:
-        cached = self._conversation_cache.get(scope)
-        if cached is not None:
-            for role, text, sources in cached:
-                self._append_message(role, text, sources)
-            return
+    def _intro_text(self) -> str:
+        agent = self.current_agent
+        class_name, lecture_name = self.current_scope
+        scope = f"{class_name} · {lecture_name}" if lecture_name else class_name or "all of your lecture notes"
+        if agent["notes_mode"] == "off":
+            return (f"Hi, I'm **{agent['name']}**. I'm in free-chat mode, so I'm not reading your notes. "
+                    "Pick a notes agent to ask about lectures.")
+        if agent["notes_mode"] == "blend":
+            return (f"Hi, I'm **{agent['name']}**, linked to **{scope}**. I'll start from your notes and cite the "
+                    "pages, then fill gaps with general knowledge (clearly marked).")
+        return (f"Hi, I'm **{agent['name']}**, linked to **{scope}**. Ask me anything from your lectures. I answer "
+                "only from your notes, with numbered citations you can open.")
 
-        class_name, lecture_name = scope
+    def _begin_conversation(self) -> None:
+        cached = self._conversation_cache.get(self._conversation_key())
+        if cached is not None:
+            for entry in cached:
+                self._append_message(entry["role"], entry["text"], entry["sources"], kind=entry["kind"])
+            return
+        class_name, lecture_name = self.current_scope
         if class_name is not None and lecture_name is None:
-            for entry in self.library.class_chat_history(class_name, limit=25):
+            for entry in self.library.class_chat_history(class_name, limit=25, agent_id=self.current_agent["id"]):
                 self._append_message("user", entry["question"])
                 self._append_message("assistant", entry["answer"], entry["sources"])
-        if self.message_widgets:
-            return
-        if lecture_name:
-            introduction = (
-                f"This conversation is scoped to {class_name} · {lecture_name}. "
-                "Ask a question or find a page; answers include citations to the selected lecture."
-            )
-        elif class_name:
-            introduction = (
-                f"This conversation is scoped to {class_name}. "
-                "Your class questions stay together here, with clickable citations to their source pages."
-            )
-        else:
-            introduction = (
-                "Hi! I can help you study from your lecture PDFs. Choose a course on the left, then ask a question "
-                "or switch to Find a page. Every answer is grounded in retrieved pages and includes citations you can open."
-            )
-        self._append_message("assistant", introduction)
+        if not self.message_widgets:
+            self._append_message("assistant", self._intro_text(), kind="intro")
 
-    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt method name
+    def _history_for_model(self) -> list[tuple[str, str]]:
+        return [(m.role, m.text) for m in self.message_widgets if getattr(m, "kind", "chat") == "chat" and m.text]
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         if hasattr(self, "message_widgets") and hasattr(self, "chat_scroll"):
             QTimer.singleShot(0, self._refresh_message_layout)
 
     def _refresh_message_layout(self) -> None:
-        available = max(280, self.chat_scroll.viewport().width() - 64)
+        available = max(280, self.chat_scroll.viewport().width() - 96)
         for message in self.message_widgets:
-            message.set_available_width(min(900 if message.role == "assistant" else 720, available))
-            message.body.setMinimumHeight(0)
-            message.body.setMinimumHeight(max(0, message.body.heightForWidth(message.body.width())))
-            message.body.updateGeometry()
-            message.layout().invalidate()
+            message.set_available_width(min(920, available))
             message.updateGeometry()
         self.chat_layout.invalidate()
 
-    def update_composer_mode(self, *_args) -> None:
-        find_mode = self.mode_combo.currentData() == "find"
-        self.send_button.setText("Find" if find_mode else "Ask")
-        self.query.setPlaceholderText(
-            "What topic or phrase should I find in your PDFs?" if find_mode
-            else "Ask something about your lectures…"
-        )
+    def set_mode(self, mode: str) -> None:
+        find_mode = mode == "find"
+        self.ask_mode_button.setChecked(not find_mode)
+        self.find_mode_button.setChecked(find_mode)
         self.semantic_search.setVisible(find_mode)
-        self.composer_help.setText(
-            "Keyword search stays on this Mac. Meaning search uses Gemini and indexed page images."
-            if find_mode
-            else "Ask uses Gemini with indexed lecture pages. Every factual answer includes clickable citations."
+        self.send_button.setText("FIND ▸" if find_mode else "SEND ▸")
+        self.query.setPlaceholderText(
+            "Topic or phrase to find in your PDFs…" if find_mode
+            else f"Message {self.current_agent['name']}…"
         )
 
+    def current_mode(self) -> str:
+        return "find" if self.find_mode_button.isChecked() else "ask"
+
     def send_message(self) -> None:
-        if self.mode_combo.currentData() == "find":
+        if self.active_task:
+            return
+        if self.current_mode() == "find":
             self.search()
         else:
             self.answer_question()
 
-    def toggle_preview(self, visible: bool) -> None:
-        self.preview_panel.setVisible(visible)
-        self.preview_toggle.setText("Hide page preview" if visible else "Show page preview")
-        total_width = max(720, self.content_splitter.width())
-        if visible:
-            preview_width = min(420, max(300, total_width // 3))
-            self.content_splitter.setSizes([total_width - preview_width, preview_width])
-        else:
-            self.content_splitter.setSizes([total_width, 0])
+    def toggle_right_panel(self, visible: bool) -> None:
+        self.right_panel.setVisible(visible)
         QTimer.singleShot(0, self._refresh_message_layout)
 
     def open_source_page(self, row: dict) -> None:
-        self.preview_toggle.setChecked(True)
+        self.panel_button.setChecked(True)
+        self.right_stack.setCurrentIndex(1)
         self.display_page(row)
 
+    # -- courses -------------------------------------------------------------------------------
     def refresh_navigation(self, select_scope: tuple[str | None, str | None] | None = None) -> None:
         if select_scope is None:
             select_scope = getattr(self, "current_scope", (None, None))
+        self.navigator.blockSignals(True)
         self.navigator.clear()
-        all_item = QTreeWidgetItem(["All materials"])
+        all_item = QTreeWidgetItem(["◇ All materials"])
         all_item.setData(0, Qt.ItemDataRole.UserRole, (None, None))
         self.navigator.addTopLevelItem(all_item)
         classes: dict[str, QTreeWidgetItem] = {}
@@ -960,62 +835,51 @@ class MainWindow(QMainWindow):
             child.setData(0, Qt.ItemDataRole.UserRole, (class_name, lecture_name))
             parent.addChild(child)
         self.navigator.expandAll()
-        if self.navigator.topLevelItemCount():
-            selected_item = all_item
-            target_class, target_lecture = select_scope
-            if target_class is not None:
-                for index in range(self.navigator.topLevelItemCount()):
-                    class_item = self.navigator.topLevelItem(index)
-                    if class_item.data(0, Qt.ItemDataRole.UserRole) == (target_class, None):
-                        selected_item = class_item
-                        if target_lecture is not None:
-                            for child_index in range(class_item.childCount()):
-                                child = class_item.child(child_index)
-                                if child.data(0, Qt.ItemDataRole.UserRole) == (target_class, target_lecture):
-                                    selected_item = child
-                                    break
-                        break
-            self.navigator.setCurrentItem(selected_item)
+        selected_item = all_item
+        target_class, target_lecture = select_scope
+        if target_class is not None and target_class in classes:
+            class_item = classes[target_class]
+            selected_item = class_item
+            for index in range(class_item.childCount()):
+                child = class_item.child(index)
+                if child.data(0, Qt.ItemDataRole.UserRole) == (target_class, target_lecture):
+                    selected_item = child
+                    break
+        self.navigator.blockSignals(False)
+        self.navigator.setCurrentItem(selected_item)
+        self.change_scope(selected_item, None)
         self.update_library_status()
 
     def update_library_status(self) -> None:
-        status = self.library.indexing_status(EMBEDDING_MODEL)
+        values = self.model_settings()
+        status = self.library.indexing_status(values["embedding_model"])
         total = status["total_pages"]
-        indexed = status["indexed_pages"]
         if total == 0:
-            self.library_status.setText("No PDFs yet. Add a lecture PDF to get started.")
+            self.library_status.setText("NO PDFS YET · ADD A LECTURE TO START")
             return
-        page_word = "page" if total == 1 else "pages"
-        self.library_status.setText(
-            f"Library · {total} {page_word}\nAI indexed: {indexed}/{total} · "
-            f"visual checks left: {status['pending_visual_pages']}"
-        )
+        lines = [f"{total} PAGES · {status['indexed_pages']}/{total} INDEXED"]
+        if status["pending_visual_pages"] and values["vision_model"]:
+            lines.append(f"HANDWRITING UNREAD: {status['pending_visual_pages']}")
+        self.library_status.setText("\n".join(lines))
 
     def change_scope(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
         if current is None:
             return
         new_scope = current.data(0, Qt.ItemDataRole.UserRole)
         if new_scope != self.current_scope:
-            if self.message_widgets:
-                self._conversation_cache[self.current_scope] = [
-                    (message.role, message.text, message.sources)
-                    for message in self.message_widgets
-                ]
+            self._cache_conversation()
             self._clear_chat()
             self.current_scope = new_scope
             self.settings.setValue("study_space/class", new_scope[0] or "")
             self.settings.setValue("study_space/lecture", new_scope[1] or "")
-            self._begin_scope_conversation(new_scope)
+            self._begin_conversation()
         class_name, lecture_name = self.current_scope
         if lecture_name:
-            self.scope_title.setText(f"{class_name} · {lecture_name}")
-            self.scope_subtitle.setText("This chat is scoped to the selected lecture. Answers include clickable source citations.")
+            self.scope_title.setText(f"{class_name} · {lecture_name}".upper())
         elif class_name:
-            self.scope_title.setText(class_name)
-            self.scope_subtitle.setText("This chat is scoped to this class. Answers include clickable source citations.")
+            self.scope_title.setText(class_name.upper())
         else:
-            self.scope_title.setText("All materials")
-            self.scope_subtitle.setText("Ask a question or find a page in your PDFs. Answers cite the source pages they use.")
+            self.scope_title.setText("ALL MATERIALS")
         self.history_button.setEnabled(class_name is not None)
 
     def open_class_history(self) -> None:
@@ -1030,75 +894,95 @@ class MainWindow(QMainWindow):
         dialog.source_opened.connect(self.open_source_page)
         dialog.exec()
 
-    def _key_status(self) -> str:
-        return (
-            "AI features are ready. Relevant PDF text and images are sent to Gemini when you use them."
-            if get_api_key()
-            else "Keyword search works locally. Add an API key for AI answers, quizzes, and meaning search."
-        )
+    def clear_conversation(self) -> None:
+        class_name, lecture_name = self.current_scope
+        if class_name and not lecture_name:
+            answer = QMessageBox.question(
+                self, "Clear conversation",
+                f"Clear {self.current_agent['name']}'s saved conversation for {class_name}?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.library.clear_class_chat(class_name, self.current_agent["id"])
+        self._conversation_cache.pop(self._conversation_key(), None)
+        self._clear_chat()
+        self._begin_conversation()
 
-    def configure_api_key(self) -> None:
-        dialog = ApiKeyDialog(self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.api_status.setText(self._key_status())
-            self.statusBar().showMessage(self._key_status(), 10000)
-
+    # -- importing -----------------------------------------------------------------------------
     def import_pdf(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(self, "Choose lecture PDF", str(Path.home()), "PDF files (*.pdf)")
-        if not filename:
+        filenames, _ = QFileDialog.getOpenFileNames(self, "Choose lecture PDFs", str(Path.home()), "PDF files (*.pdf)")
+        if not filenames:
             return
         selected_class = self.current_scope[0]
-        details = ImportDetailsDialog(filename, self, selected_class or "")
-        if details.exec() != QDialog.DialogCode.Accepted:
-            return
-        class_name = details.class_name.text().strip()
-        lecture_name = details.lecture_name.text().strip()
-        if not class_name or not lecture_name:
-            QMessageBox.warning(self, "Missing details", "Enter both a class and lecture name.")
-            return
-        path = Path(filename)
+        if len(filenames) == 1:
+            details = ImportDetailsDialog(filenames[0], self, selected_class or "")
+            if details.exec() != QDialog.DialogCode.Accepted:
+                return
+            specs = [(Path(filenames[0]), details.class_name.text().strip(), details.lecture_name.text().strip())]
+            if not specs[0][1] or not specs[0][2]:
+                QMessageBox.warning(self, "Missing details", "Enter both a class and lecture name.")
+                return
+        else:
+            details = BatchImportDetailsDialog(filenames, self, selected_class or "")
+            if details.exec() != QDialog.DialogCode.Accepted:
+                return
+            specs = details.import_specs()
+        self._import_pdf_specs(specs)
+
+    def _import_pdf_specs(self, specs: list[tuple[Path, str, str]]) -> None:
         database = self.library.path
 
-        def import_pages(progress: Callable[[str], None]) -> dict[str, int | str]:
-            progress(f"Reading pages from {path.name}…")
-            page_texts = extract_page_texts(path)
-            progress(f"Saving {len(page_texts)} page(s) to your local library…")
+        def import_pages(progress: TaskReporter) -> dict:
+            imported, failures = [], []
             library = Library(database)
             try:
-                library.import_pdf(class_name, lecture_name, path, page_texts)
+                for index, (path, class_name, lecture_name) in enumerate(specs, start=1):
+                    progress(f"Reading PDF {index} of {len(specs)}: {path.name}…")
+                    try:
+                        page_texts = extract_page_texts(path)
+                        library.import_pdf(class_name, lecture_name, path, page_texts)
+                        imported.append({
+                            "filename": path.name, "page_count": len(page_texts),
+                            "empty_pages": sum(not text for text in page_texts),
+                            "class_name": class_name, "lecture_name": lecture_name,
+                        })
+                    except Exception as error:
+                        failures.append(f"{path.name}: {error}")
             finally:
                 library.close()
-            return {
-                "filename": path.name,
-                "page_count": len(page_texts),
-                "empty_pages": sum(not text for text in page_texts),
-            }
+            return {"imported": imported, "failures": failures}
 
         def imported(result: object) -> None:
-            self.refresh_navigation((class_name, lecture_name))
-            empty_pages = result["empty_pages"]
-            note = (
-                f"{empty_pages} page(s) have no embedded text; page images remain available to AI search."
-                if empty_pages else "All pages have embedded text."
-            )
-            self.statusBar().showMessage(
-                f"Imported {result['filename']}: {result['page_count']} pages. {note}", 12000,
-            )
+            files = result["imported"]
+            if files:
+                last = files[-1]
+                self.refresh_navigation((last["class_name"], last["lecture_name"]))
+                pages = sum(item["page_count"] for item in files)
+                self.statusBar().showMessage(
+                    f"Imported {len(files)} PDF(s), {pages} page(s). Press INDEX FOR SEARCH to enable meaning search.",
+                    15000,
+                )
+            if result["failures"]:
+                QMessageBox.warning(
+                    self, "Some PDFs could not be imported",
+                    "The other PDFs were imported successfully.\n\n" + "\n".join(result["failures"]),
+                )
+            elif not files:
+                QMessageBox.warning(self, "No PDFs imported", "None of the selected PDFs could be imported.")
 
-        self._run_task(
-            import_pages,
-            imported,
-            on_error=lambda error: QMessageBox.critical(self, "Could not import PDF", error),
-        )
+        self._run_task(import_pages, imported,
+                       on_error=lambda error: QMessageBox.critical(self, "Could not import PDF", error))
 
+    # -- task runner ---------------------------------------------------------------------------
     def _run_task(
         self,
-        action: Callable[[Callable[[str], None]], object],
+        action: Callable[[TaskReporter], object],
         on_success: Callable[[object], None],
         on_error: Callable[[str], None] | None = None,
+        state: str = "WORKING",
     ) -> bool:
         if self.active_task:
-            QMessageBox.information(self, "Still working", "Wait for the current Gemini operation to finish.")
+            QMessageBox.information(self, "Still working", "Wait for the current operation to finish.")
             return False
         task = BackgroundTask(action)
         self.active_task = task
@@ -1107,20 +991,25 @@ class MainWindow(QMainWindow):
         for control in self.task_controls:
             control.setEnabled(False)
         task.progress.connect(self.statusBar().showMessage)
+        task.chunk.connect(self._queue_token)
+        task.thinking.connect(self._on_thinking)
+        task.event.connect(self._on_task_event)
         task.finished.connect(self._task_finished)
+        self._set_state(state)
         task.start()
         return True
 
     def _task_finished(self) -> None:
         task = self.active_task
         self.active_task = None
+        self._flush_tokens()
+        self._token_timer.stop()
         for control in self.task_controls:
             control.setEnabled(True)
         self.history_button.setEnabled(self.current_scope[0] is not None)
-        handler = self.task_success_handler
-        error_handler = self.task_error_handler
-        self.task_success_handler = None
-        self.task_error_handler = None
+        handler, error_handler = self.task_success_handler, self.task_error_handler
+        self.task_success_handler = self.task_error_handler = None
+        self._set_state("OFFLINE" if self.ollama_online is False else "IDLE")
         if task is None:
             return
         task.deleteLater()
@@ -1131,199 +1020,272 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("The operation could not be completed.", 8000)
             if error_handler is not None:
                 error_handler(task.error)
+            elif isinstance(task.exception, FileNotFoundError):
+                missing = getattr(task.exception, "filename", None)
+                self._append_message(
+                    "assistant",
+                    f"I couldn't open the original PDF at {missing}. The imported text is still saved, but the page "
+                    "image is unavailable. Check that the PDF is still there, then re-import it if you moved or "
+                    "renamed it.",
+                    kind="error",
+                )
             else:
-                self._append_message("assistant", f"I couldn't complete that operation.\n\n{task.error}")
+                self._append_message("assistant", f"I couldn't complete that.\n\n{task.error}", kind="error")
         elif handler is not None:
             handler(task.result)
+        self.query.setFocus()
 
+    def _queue_token(self, token: str) -> None:
+        if self._streaming_message is None:
+            return
+        if not self._pending_tokens and self.panel_state.text() != "◆ STREAMING":
+            self._set_state("STREAMING")
+        self._pending_tokens.append(token)
+        if not self._token_timer.isActive():
+            self._token_timer.start()
+
+    def _flush_tokens(self) -> None:
+        if self._streaming_message is not None and self._pending_tokens:
+            self._streaming_message.append_token("".join(self._pending_tokens))
+            self._pending_tokens.clear()
+            bar = self.chat_scroll.verticalScrollBar()
+            if bar.maximum() - bar.value() < 160:
+                QTimer.singleShot(0, self._scroll_to_bottom)
+
+    def _on_thinking(self, token: str) -> None:
+        if self._streaming_message is not None:
+            if self.panel_state.text() != "◆ REASONING":
+                self._set_state("REASONING")
+            self._streaming_message.append_thinking(token)
+
+    def _on_task_event(self, payload: dict) -> None:
+        if payload.get("state"):
+            self._set_state(payload["state"])
+        if payload.get("retrieval") and self._streaming_message is not None:
+            self._streaming_message.set_retrieval(payload["retrieval"])
+
+    # -- indexing & search ---------------------------------------------------------------------
     def index_library(self) -> None:
-        if not get_api_key():
-            self.configure_api_key()
-            if not get_api_key():
-                return
         database = self.library.path
+        models = self._models()
 
-        def index(progress: Callable[[str], None]) -> dict[str, int]:
+        def index(progress: TaskReporter) -> dict:
             library = Library(database)
             try:
-                pages_to_scan = [dict(row) for row in library.pages_needing_visual_scan()]
-                notes_checked = 0
-                if pages_to_scan:
-                    service = GeminiService()
-                    progress(
-                        f"Reading handwriting and visual labels on {len(pages_to_scan)} page(s)… "
-                        "This may take a while the first time."
-                    )
-                    notes_checked = service.read_visual_notes_batch(
-                        pages_to_scan, library.save_visual_text, progress,
-                    )
-                pages = [dict(row) for row in library.pages_to_index(EMBEDDING_MODEL)]
-                if not pages:
-                    return {"indexed": 0, "notes_checked": notes_checked}
-                if not pages_to_scan:
-                    service = GeminiService()
-                progress(f"Creating searchable embeddings for {len(pages)} page(s)…")
-                indexed = service.index_pages(pages, library.save_embedding, progress)
-                return {"indexed": indexed, "notes_checked": notes_checked}
+                notes_checked, vision_note = 0, ""
+                pending_visual = [dict(row) for row in library.pages_needing_visual_scan()]
+                if pending_visual and models.vision_model:
+                    if models.vision_ready():
+                        progress(f"Reading handwriting on {len(pending_visual)} page(s) with {models.vision_model}…")
+                        notes_checked = models.read_visual_notes(pending_visual, library.save_visual_text, progress)
+                    else:
+                        vision_note = (f" Handwriting skipped: run `ollama pull {models.vision_model}` to enable it.")
+                pages = [dict(row) for row in library.pages_to_index(models.embedding_model)]
+                indexed = 0
+                if pages:
+                    progress(f"Embedding {len(pages)} page(s) with {models.embedding_model}…")
+                    indexed = models.index_pages(pages, library.save_embedding, progress)
+                return {"indexed": indexed, "notes_checked": notes_checked, "vision_note": vision_note}
             finally:
                 library.close()
 
         def indexed(result: object) -> None:
             if result["indexed"] or result["notes_checked"]:
-                summary = f"Indexed {result['indexed']} page(s); checked {result['notes_checked']} page(s) for handwriting."
+                summary = f"Indexed {result['indexed']} page(s); read handwriting on {result['notes_checked']}."
             else:
-                summary = "Your PDFs are already indexed and visual notes have already been checked."
-            self.statusBar().showMessage(summary, 12000)
+                summary = "Everything is already indexed."
+            self.statusBar().showMessage(summary + result["vision_note"], 15000)
 
-        self._run_task(index, indexed)
+        self._run_task(index, indexed, state="INDEXING")
+
+    def _retrieve(self, models: StudyModels, query: str, progress: TaskReporter, limit: int,
+                  class_name: str | None, lecture_name: str | None, semantic: bool = True) -> tuple[list[dict], str]:
+        """Hybrid keyword + vector retrieval. Falls back to keywords if embeddings are unavailable."""
+        vector, note = None, ""
+        if semantic:
+            try:
+                vector = models.embed_query(query)
+            except OllamaUnavailable:
+                raise
+            except OllamaError:
+                note = f" · KEYWORDS ONLY (pull {models.embedding_model})"
+        library = Library(self.library.path)
+        try:
+            rows = [dict(row) for row in library.search(
+                query, query_embedding=vector, model=models.embedding_model, limit=max(limit, 20),
+                class_name=class_name, lecture_name=lecture_name, match_any=True,
+            )[:limit]]
+        finally:
+            library.close()
+        return rows, note
 
     def search(self) -> None:
         query = self.query.text().strip()
         if not query:
             return
         class_name, lecture_name = self.current_scope
-        if self.semantic_search.isChecked():
-            if not get_api_key():
-                self.configure_api_key()
-                if not get_api_key():
-                    return
-        self._append_message("user", query)
+        self._append_message("user", query, kind="search")
         self.query.clear()
-        find = query
+        semantic = self.semantic_search.isChecked()
 
-        def display_matches(rows: object) -> None:
-            self.show_search_results(rows, find)
+        def display(rows: object) -> None:
+            self.show_search_results(rows, query)
 
-        if self.semantic_search.isChecked():
-            database = self.library.path
+        if semantic:
+            models = self._models()
 
-            def semantic_search(progress: Callable[[str], None]) -> list[dict]:
+            def run(progress: TaskReporter) -> list[dict]:
                 progress("Searching your PDFs by meaning…")
-                embedding = GeminiService().embed_text(find)
-                library = Library(database)
-                try:
-                    return library.search(
-                        find, query_embedding=embedding, model=EMBEDDING_MODEL, limit=12,
-                        class_name=class_name, lecture_name=lecture_name,
-                    )
-                finally:
-                    library.close()
+                rows, _note = self._retrieve(models, query, progress, 12, class_name, lecture_name)
+                return rows
 
-            self._run_task(semantic_search, display_matches)
+            def fallback(error: str) -> None:
+                rows = self.library.search(query, limit=12, class_name=class_name, lecture_name=lecture_name)
+                self.show_search_results(rows, query, note="Ollama is offline, so this used keyword search only.")
+
+            self._run_task(run, display, on_error=fallback, state="SEARCHING")
             return
         try:
-            rows = self.library.search(find, limit=12, class_name=class_name, lecture_name=lecture_name)
+            rows = self.library.search(query, limit=12, class_name=class_name, lecture_name=lecture_name)
         except Exception as error:
-            self._append_message("assistant", f"I couldn't search those terms: {error}")
+            self._append_message("assistant", f"I couldn't search those terms: {error}", kind="error")
             return
-        display_matches(rows)
+        display(rows)
 
-    def show_search_results(self, rows: object, query: str = "") -> None:
+    def show_search_results(self, rows: object, query: str = "", note: str = "") -> None:
         matches = [dict(row) for row in rows]
         if matches:
-            text = f"I found {len(matches)} relevant page(s) for “{query}”. Select a citation below to open that page."
+            text = f"Found **{len(matches)}** page(s) for “{query}”. Open one below."
         else:
-            text = (
-                f"I couldn't find a page matching “{query}”. Try different wording, or turn on Search by meaning "
-                "to look for related concepts."
-            )
-        self._append_message("assistant", text, matches)
+            text = f"No page matched “{query}”. Try other wording, or turn on BY MEANING."
+        if note:
+            text += f"\n\n*{note}*"
+        self._append_message("assistant", text, matches, kind="search",
+                             retrieval=f"SEARCHED “{query}” · {len(matches)} HITS")
         self.statusBar().showMessage(f"Found {len(matches)} matching page(s).", 5000)
 
     def display_page(self, row: dict) -> None:
         self.current_result = row
         path = Path(row["file_path"])
         page_number = row["page_number"]
-        self.preview_title.setText(
-            f"{row['class_name']} · {row['lecture_name']} · page {page_number}\n{path.name}"
-        )
-        body = row["text"].strip() or "No searchable embedded text on this page."
-        visual_text = row.get("visual_text", "").strip()
+        self.preview_title.setText(f"{row['class_name']} · {row['lecture_name']} · P.{page_number}\n{path.name}".upper())
+        body = (row.get("text") or "").strip() or "No embedded text on this page."
+        visual_text = (row.get("visual_text") or "").strip()
         if visual_text:
-            body += "\n\nAI-read handwriting / visual notes (verify against the page):\n" + visual_text
+            body += "\n\nMachine-read handwriting / visual notes (verify against the page):\n" + visual_text
         self.excerpt.setPlainText(body)
         try:
             pixmap = QPixmap()
             pixmap.loadFromData(render_page(path, page_number))
+            target = self.preview.size() if self.preview.width() > 50 else self.right_panel.size()
             self.preview.setPixmap(pixmap.scaled(
-                self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+                target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
             ))
         except (OSError, ValueError, RuntimeError) as error:
             self.preview.setText(f"Could not render page: {error}")
 
-    def answer_question(self) -> None:
-        question = self.query.text().strip()
+    # -- asking --------------------------------------------------------------------------------
+    def answer_question(self, question: str | None = None, *, add_user: bool = True,
+                        fixed_sources: list[dict] | None = None) -> None:
+        question = (question if question is not None else self.query.text()).strip()
         if not question:
             return
-        if not get_api_key():
-            self.configure_api_key()
-            if not get_api_key():
-                return
-        self._append_message("user", question)
-        self.query.clear()
-        database = self.library.path
+        agent = dict(self.current_agent)
+        history = self._history_for_model()
+        if add_user:
+            self._append_message("user", question)
+            self.query.clear()
+        message = self._append_message("assistant", "", streaming=True)
+        self._streaming_message = message
+        self._pending_tokens.clear()
+        models = self._models()
+        model = self.agent_model(agent)
         class_name, lecture_name = self.current_scope
+        database = self.library.path
 
-        def answer(progress: Callable[[str], None]) -> dict:
-            service = GeminiService()
-            progress("Finding relevant pages…")
-            query_vector = service.embed_text(question, task="question answering")
-            library = Library(database)
-            try:
-                sources = [dict(row) for row in library.search(
-                    question, query_embedding=query_vector, model=EMBEDDING_MODEL, limit=20,
-                    class_name=class_name, lecture_name=lecture_name,
-                )[:5]]
+        def answer(progress: TaskReporter) -> dict:
+            sources: list[dict] = []
+            note = ""
+            if agent["notes_mode"] != "off":
+                if fixed_sources is not None:
+                    sources = [dict(s) for s in fixed_sources]
+                else:
+                    progress.event({"state": "SEARCHING"})
+                    progress("Searching your notes…")
+                    sources, note = self._retrieve(models, question, progress, RETRIEVED_PAGES,
+                                                   class_name, lecture_name)
                 for index, source in enumerate(sources, start=1):
                     source["source_id"] = f"S{index}"
-                if not sources:
-                    result = {
-                        "answer": "I couldn't find matching pages in the indexed course material, so I can't answer from your sources yet.",
-                        "sources": [],
-                    }
-                else:
-                    progress("Writing an answer from the retrieved pages…")
-                    answer_result = service.answer_grounded(question, sources)
-                    used_ids = set(answer_result["used_source_ids"])
-                    visible_sources = [source for source in sources if not answer_result["answerable"] or source["source_id"] in used_ids]
-                    result = {"answer": answer_result["answer"], "sources": visible_sources}
-                if class_name:
-                    library.save_class_chat(class_name, question, result["answer"], result["sources"])
-                return result
-            finally:
-                library.close()
+                progress.event({"retrieval": f"SEARCHED NOTES · {len(sources)} PAGE{'S' if len(sources) != 1 else ''}{note}"})
+            progress.event({"state": "THINKING"})
+            progress(f"{model} is writing…")
+            result = models.stream_answer(
+                question, sources, model=model, persona=agent["system_prompt"], notes_mode=agent["notes_mode"],
+                temperature=float(agent["temperature"]), num_ctx=CONTEXT_WINDOW, reasoning=bool(agent["reasoning"]),
+                history=history, on_token=progress.token, on_thinking=progress.think,
+            )
+            if class_name and fixed_sources is None:
+                library = Library(database)
+                try:
+                    library.save_class_chat(class_name, question, result["answer"], result["sources"], agent["id"])
+                finally:
+                    library.close()
+            return result
 
-        def show_answer(result: object) -> None:
-            sources = result["sources"]
-            self._append_message("assistant", result["answer"], sources)
+        def show(result: object) -> None:
+            self._streaming_message = None
+            message.finish(result["answer"], result["sources"])
+            if not result.get("answerable", True):
+                message.kind = "notfound"
+            speed = result.get("tokens_per_second", 0.0)
+            self.stat_speed.setText(f"{speed:.0f} t/s" if speed else "—")
+            self.speed_meter.set_value(speed / 100)
+            context = result.get("context_used", 0.0)
+            self.stat_context.setText(f"{context:.0%} of {CONTEXT_WINDOW // 1024}k")
+            self.context_meter.set_value(context)
+            self.statusBar().showMessage(f"{model} · {speed:.1f} tokens/s", 8000)
+            QTimer.singleShot(0, self._refresh_message_layout)
 
-        self._run_task(answer, show_answer)
+        def failed(error: str) -> None:
+            self._streaming_message = None
+            message.kind = "error"
+            message.finish(f"⚠ {error}", [])
+
+        if not self._run_task(answer, show, on_error=failed, state="THINKING"):
+            self._streaming_message = None
+            message.finish("Another operation is still running.", [])
+
+    def regenerate(self, message: ChatMessageWidget) -> None:
+        if self.active_task or message not in self.message_widgets:
+            return
+        index = self.message_widgets.index(message)
+        question = next((m.text for m in reversed(self.message_widgets[:index]) if m.role == "user"), None)
+        if not question:
+            return
+        for widget in self.message_widgets[index:]:
+            self.chat_layout.removeWidget(widget)
+            widget.hide()
+            widget.deleteLater()
+        del self.message_widgets[index:]
+        # drop the matching user turn from model history, then re-ask without re-adding it
+        user_widget = self.message_widgets.pop() if self.message_widgets and self.message_widgets[-1].role == "user" else None
+        if user_widget is not None:
+            self.chat_layout.removeWidget(user_widget)
+            user_widget.hide()
+            user_widget.deleteLater()
+        self.answer_question(question)
 
     def explain_more(self, passage: str, sources: list[dict]) -> None:
-        if not sources:
+        if self.active_task:
             return
         self._append_message("user", f"Can you explain this more deeply?\n\n{passage}")
+        self.answer_question(
+            f"Explain this passage in more depth, step by step:\n{passage}", add_user=False,
+            fixed_sources=sources or None,
+        )
 
-        def explain(progress: Callable[[str], None]) -> dict:
-            progress("Preparing a deeper explanation from the cited pages…")
-            service = GeminiService()
-            question = f"Explain this selected answer passage in greater depth, using only the supplied course sources:\n{passage}"
-            result = service.answer_grounded(question, sources)
-            used_ids = set(result["used_source_ids"])
-            visible_sources = [source for source in sources if not result["answerable"] or source["source_id"] in used_ids]
-            return {"answer": result["answer"], "sources": visible_sources}
-
-        def show_explanation(result: object) -> None:
-            self._append_message("assistant", result["answer"], result["sources"])
-
-        self._run_task(explain, show_explanation)
-
+    # -- quizzes -------------------------------------------------------------------------------
     def start_quiz(self) -> None:
-        if not get_api_key():
-            self.configure_api_key()
-            if not get_api_key():
-                return
         documents = [dict(row) for row in self.library.documents()]
         if not documents:
             QMessageBox.information(self, "No lectures yet", "Import a PDF before building a quiz.")
@@ -1333,85 +1295,70 @@ class MainWindow(QMainWindow):
             self.generate_quiz(setup.scopes, setup.question_count.value(), setup.question_type.currentData())
 
     def generate_quiz(self, scopes: list[tuple[str, str]], count: int, mode: str, focus_topic: str | None = None) -> None:
-        if not get_api_key():
-            self.configure_api_key()
-            if not get_api_key():
-                return
         database = self.library.path
+        models = self._models()
 
-        def generate(progress: Callable[[str], None]) -> dict:
+        def generate(progress: TaskReporter) -> dict:
             library = Library(database)
             try:
                 progress("Selecting source pages from the chosen lectures…")
-                sources = library.pages_for_scopes(scopes, limit=16)
+                sources = library.pages_for_scopes(scopes, limit=12)
                 if not sources:
                     return {"questions": [], "sources": []}
                 for index, source in enumerate(sources, start=1):
                     source["source_id"] = f"S{index}"
-                progress("Writing practice questions and answer rubrics…")
-                generated = GeminiService().generate_quiz(count, mode, sources, focus_topic=focus_topic)
-                saved = library.create_quiz_session(scopes, generated)
-                return {"questions": saved, "sources": sources}
+                progress(f"{models.chat_model} is writing practice questions…")
+                generated = models.generate_quiz(count, mode, sources, focus_topic=focus_topic)
+                return {"questions": library.create_quiz_session(scopes, generated), "sources": sources}
             finally:
                 library.close()
 
-        def show_quiz(result: object) -> None:
-            if not result["questions"]:
-                QMessageBox.information(self, "No source pages", "The selected lectures have no pages available to quiz.")
-                return
-            dialog = QuizRunDialog(result["questions"], self)
-            dialog.answer_submitted.connect(lambda question, answer: self.grade_quiz_answer(dialog, question, answer))
-            dialog.exec()
-            self.statusBar().showMessage("Quiz finished. Weak-topic scores are updated in SQLite.", 10000)
+        self._run_task(generate, self._show_quiz, state="WRITING QUIZ")
 
-        self._run_task(generate, show_quiz)
+    def _show_quiz(self, result: object) -> None:
+        if not result["questions"]:
+            QMessageBox.information(self, "No source pages", "The selected lectures have no pages available to quiz.")
+            return
+        dialog = QuizRunDialog(result["questions"], self)
+        dialog.answer_submitted.connect(lambda question, answer: self.grade_quiz_answer(dialog, question, answer))
+        dialog.exec()
+        self.statusBar().showMessage("Quiz finished. Weak-topic scores are updated.", 10000)
 
     @staticmethod
     def _citation_labels(question: dict, sources: list[dict]) -> str:
-        labels = []
         source_map = {source["source_id"]: source for source in sources}
-        for source_id in question["source_ids"]:
-            source = source_map[source_id]
-            labels.append(
-                f"{source['class_name']} · {source['lecture_name']} · "
-                f"{Path(source['file_path']).name} · p. {source['page_number']}"
-            )
+        labels = [
+            f"{s['class_name']} · {s['lecture_name']} · {Path(s['file_path']).name} · p. {s['page_number']}"
+            for s in (source_map[sid] for sid in question["source_ids"])
+        ]
         return "; ".join(dict.fromkeys(labels))
 
     def grade_quiz_answer(self, dialog: QuizRunDialog, question: dict, answer: str) -> None:
-        sources = [question["source_map"][source_id] for source_id in question["source_ids"]]
+        sources = [question["source_map"][sid] for sid in question["source_ids"]]
         citations = self._citation_labels(question, sources)
         if question["question_type"] == "multiple_choice":
             correct = answer == question["correct_answer"]
             score = 1.0 if correct else 0.0
-            feedback = "Your choice is correct." if correct else f"That choice is incorrect. The cited explanation below shows the key idea."
+            feedback = "Your choice is correct." if correct else "That choice is incorrect. The cited explanation below shows the key idea."
             self.library.record_quiz_attempt(question["id"], answer, score, correct, feedback)
-            dialog.show_grade({
-                "score": score,
-                "is_correct": correct,
-                "feedback": feedback,
-                "explanation_citations": f"[{citations}]",
-            })
+            dialog.show_grade({"score": score, "is_correct": correct, "feedback": feedback,
+                               "explanation_citations": f"[{citations}]"})
             return
-
         database = self.library.path
+        models = self._models()
 
-        def grade(progress: Callable[[str], None]) -> dict:
-            progress("Grading against the answer rubric and cited lecture pages…")
-            result = GeminiService().grade_short_answer(question, answer, sources)
-            feedback = result["feedback"]
+        def grade(progress: TaskReporter) -> dict:
+            progress("Grading against the rubric and cited lecture pages…")
+            result = models.grade_short_answer(question, answer, sources)
             library = Library(database)
             try:
-                library.record_quiz_attempt(question["id"], answer, result["score"], result["is_correct"], feedback)
+                library.record_quiz_attempt(question["id"], answer, result["score"], result["is_correct"], result["feedback"])
             finally:
                 library.close()
-            return {
-                **result,
-                "explanation_citations": f"[{citations}]",
-            }
+            return {**result, "explanation_citations": f"[{citations}]"}
 
         dialog.set_grading(True)
-        if not self._run_task(grade, dialog.show_grade, on_error=dialog.grading_failed):
+        if not self._run_task(grade, dialog.show_grade, on_error=dialog.grading_failed, state="GRADING"):
             dialog.grading_failed()
 
     def open_weak_spots(self) -> None:
@@ -1420,47 +1367,35 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def generate_topic_review(self, topic: str) -> None:
-        if not get_api_key():
-            self.configure_api_key()
-            if not get_api_key():
-                return
         database = self.library.path
+        models = self._models()
 
-        def retrieve_and_generate(progress: Callable[[str], None]) -> dict:
-            service = GeminiService()
+        def retrieve_and_generate(progress: TaskReporter) -> dict:
             progress(f"Finding source pages for {topic}…")
-            vector = service.embed_text(topic)
+            sources, _ = self._retrieve(models, topic, progress, 12, None, None)
+            if not sources:
+                return {"questions": [], "sources": []}
+            for index, source in enumerate(sources, start=1):
+                source["source_id"] = f"S{index}"
+            scopes = sorted({(s["class_name"], s["lecture_name"]) for s in sources})
+            progress(f"Building a targeted review quiz for {topic}…")
+            generated = models.generate_quiz(3, "mixed", sources, focus_topic=topic)
             library = Library(database)
             try:
-                sources = [dict(row) for row in library.search(
-                    topic, query_embedding=vector, model=EMBEDDING_MODEL, limit=16
-                )]
-                if not sources:
-                    return {"questions": [], "sources": []}
-                for index, source in enumerate(sources, start=1):
-                    source["source_id"] = f"S{index}"
-                scopes = sorted({(source["class_name"], source["lecture_name"]) for source in sources})
-                progress(f"Building a targeted review quiz for {topic}…")
-                generated = service.generate_quiz(3, "mixed", sources, focus_topic=topic)
-                saved = library.create_quiz_session(scopes, generated)
-                return {"questions": saved, "sources": sources}
+                return {"questions": library.create_quiz_session(scopes, generated), "sources": sources}
             finally:
                 library.close()
 
-        def show_review(result: object) -> None:
-            if not result["questions"]:
-                QMessageBox.information(self, "No matching pages", f"I couldn't find course pages for {topic}.")
-                return
-            dialog = QuizRunDialog(result["questions"], self)
-            dialog.answer_submitted.connect(lambda question, answer: self.grade_quiz_answer(dialog, question, answer))
-            dialog.exec()
+        self._run_task(retrieve_and_generate, self._show_quiz, state="WRITING QUIZ")
 
-        self._run_task(retrieve_and_generate, show_review)
-
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt method name
+    # -- shutdown ------------------------------------------------------------------------------
+    def closeEvent(self, event) -> None:  # noqa: N802
         self.closing = True
+        if self.monitor:
+            self.monitor.stop()
+            self.monitor.wait(3000)
         if self.active_task and self.active_task.isRunning():
-            self.statusBar().showMessage("Waiting for the current Gemini request to finish before closing…")
+            self.statusBar().showMessage("Waiting for the current local-model request to finish…")
             self.active_task.wait()
         self.library.close()
         super().closeEvent(event)
@@ -1468,6 +1403,7 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
