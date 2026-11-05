@@ -138,6 +138,23 @@ class LibraryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.library.search("priority inversion", limit=0)
 
+    def test_theme_migration_recolors_built_in_agents_and_keeps_custom_colors(self) -> None:
+        path = Path(self.temp_dir.name) / "colors.sqlite3"
+        library = Library(path)
+        rows = (("Tutor", "#9b87f5"), ("Explainer", "#2ee6d6"), ("Free chat", "#f5c451"), ("Mine", "#2ee6d6"))
+        for name, accent in rows:
+            library.connection.execute("UPDATE agents SET accent=? WHERE name=?", (accent, name))
+        library.connection.execute("INSERT INTO agents(name, accent) VALUES ('Mine', '#2ee6d6')")
+        library.connection.execute("PRAGMA user_version = 5")
+        library.connection.commit()
+        library.close()
+
+        migrated = Library(path)
+        self.addCleanup(migrated.close)
+        self.assertEqual({a["name"]: a["accent"] for a in migrated.agents()}, {
+            "Tutor": "#00e5ff", "Explainer": "#fcee0a", "Free chat": "#f5c451", "Mine": "#2ee6d6",
+        })
+
     def test_migrates_version_one_page_index_and_visual_notes(self) -> None:
         legacy_path = self.root / "legacy.sqlite3"
         connection = sqlite3.connect(legacy_path)
@@ -173,17 +190,31 @@ class LibraryTests(unittest.TestCase):
 
         migrated = Library(legacy_path)
         self.addCleanup(migrated.close)
-        self.assertEqual(migrated.connection.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(migrated.connection.execute("PRAGMA user_version").fetchone()[0], 9)
         self.assertEqual(len(migrated.pages_needing_visual_scan()), 1)
         self.assertEqual(migrated.search("priority inversion")[0]["page_id"], 1)
         migrated.save_visual_text(1, "handwritten priority inheritance")
         self.assertEqual(migrated.search("priority inheritance")[0]["visual_text"], "handwritten priority inheritance")
 
 
+    def test_migration_repairs_dropdown_labels_saved_as_agent_models(self) -> None:
+        path = self.root / "labels.sqlite3"
+        library = Library(path)
+        rows = library.agents()
+        for agent, model in zip(rows, ("Default (qwen3:4b)", "qwen3:8b  ·  5.2 GB", "qwen3:14b")):
+            library.connection.execute("UPDATE agents SET model=? WHERE id=?", (model, agent["id"]))
+        library.connection.execute("PRAGMA user_version = 6")
+        library.connection.commit()
+        library.close()
+
+        migrated = Library(path)
+        self.addCleanup(migrated.close)
+        self.assertEqual([a["model"] for a in migrated.agents()], ["qwen3:4b", "qwen3:8b", "qwen3:14b"])
+
     def test_default_agents_are_seeded_and_editable(self) -> None:
         agents = self.library.agents()
         self.assertEqual([agent["name"] for agent in agents], ["Tutor", "Explainer", "Free chat"])
-        self.assertEqual({agent["notes_mode"] for agent in agents}, {"strict", "blend", "off"})
+        self.assertEqual([agent["notes_mode"] for agent in agents], ["strict", "blend", "blend"])
         new_id = self.library.save_agent({
             "name": "OS TA", "model": "llama3.1:8b", "temperature": 0.4, "notes_mode": "strict",
             "reasoning": True, "accent": "#ff6ac1", "system_prompt": "Be terse.",
@@ -212,6 +243,18 @@ class LibraryTests(unittest.TestCase):
         question = "How does Xinu handle priority inversion?"
         self.assertEqual(self.library.search(question), [])
         self.assertEqual(len(self.library.search(question, match_any=True)), 1)
+
+
+    def test_no_notes_agents_become_notes_plus_general_knowledge(self) -> None:
+        free_chat = self.library.agents()[2]
+        self.library.connection.execute("UPDATE agents SET notes_mode='off' WHERE id=?", (free_chat["id"],))
+        self.library.connection.execute("PRAGMA user_version = 8")
+        self.library.connection.commit()
+        migrated = Library(self.library.path)
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.agent(free_chat["id"])["notes_mode"], "blend")
+        with self.assertRaises(ValueError):
+            migrated.save_agent({**free_chat, "notes_mode": "off"})
 
 
 if __name__ == "__main__":

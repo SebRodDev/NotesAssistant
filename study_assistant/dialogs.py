@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import sys
+import threading
+from collections.abc import Sequence
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -12,11 +16,13 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QKeySequenceEdit,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -31,15 +37,28 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .macos import KEY_CODES, Shortcut, shortcut_label
+from .hardware import detect_hardware, download_choices, fetch_models_by_role, is_installed, models_by_role
+from .providers import (
+    GEMINI,
+    KEY_URL,
+    OLLAMA,
+    PROVIDER_LABELS,
+    best_model,
+    get_api_key,
+    make_client,
+    model_fits,
+)
+from .gemini import check_models, health_label, mask_key, recommend
 from .ollama import (
     DEFAULT_CHAT_MODEL,
     DEFAULT_EMBEDDING_MODEL,
-    DEFAULT_VISION_MODEL,
+    DEFAULT_HOST,
     NOTES_MODES,
     OllamaClient,
     OllamaError,
 )
-from .theme import ACCENTS, creativity_label
+from .theme import ACCENTS, COLORS, creativity_label
 from .widgets import AgentAvatar
 
 
@@ -437,9 +456,201 @@ class ClassHistoryDialog(QDialog):
 # Agents and local models
 # ---------------------------------------------------------------------------------------------
 
-def is_embedding_model(name: str) -> bool:
-    lowered = name.casefold()
-    return any(key in lowered for key in ("embed", "bge-", "minilm", "arctic-embed"))
+class ModelDownload(QObject):
+    """Pulls a model on a daemon thread, so it outlives the dialog and never blocks quitting.
+
+    Ollama resumes a partial download, so stopping when the app quits loses nothing.
+    """
+
+    progress = Signal(str)
+    done = Signal(str, str)  # model name, then a readable error (empty on success)
+
+    active: dict[tuple[str, str], "ModelDownload"] = {}
+
+    def __init__(self, host: str, name: str) -> None:
+        super().__init__()
+        self.host, self.name = host, name
+        self.latest = f"Starting download of {name}…"
+
+    @classmethod
+    def start(cls, host: str, name: str) -> "ModelDownload":
+        download = cls.active.get((host, name))
+        if download is None:
+            download = cls.active[host, name] = cls(host, name)
+            threading.Thread(target=download._run, daemon=True).start()
+        return download
+
+    def _report(self, text: str) -> None:
+        if text != self.latest:
+            self.latest = text
+            self.progress.emit(text)
+
+    def _run(self) -> None:
+        error = ""
+        try:
+            OllamaClient(self.host).pull(self.name, self._report)
+        except OllamaError as failure:
+            error = str(failure)
+        del self.active[self.host, self.name]
+        self.done.emit(self.name, error)
+
+
+class ModelField(QWidget):
+    """A dropdown of the installed models that fit one role, plus a menu to download more.
+
+    The list can't be typed into: only models Ollama reports as installed (and able to do the job)
+    can be chosen. A saved model that has since been removed stays visible, marked NOT INSTALLED,
+    so it isn't silently swapped for another one.
+    """
+
+    installed_changed = Signal()
+
+    def __init__(self, role: str, host: str, parent: QWidget | None = None, cloud: bool = False) -> None:
+        super().__init__(parent)
+        self.role, self.host = role, host
+        self.cloud = cloud  # Gemini: models live on Google's servers, so nothing to download
+        self.hardware = detect_hardware()
+        self.installed: list[str] = []
+        self.choices: dict = {}
+        self._followed: set[ModelDownload] = set()
+        self._requested: str | None = None
+
+        self.combo = QComboBox()
+        self.combo.setEditable(False)
+        self.combo.setMaxVisibleItems(16)
+        self.combo.currentIndexChanged.connect(self._refresh)
+
+        self.download_button = QPushButton()
+        self.download_button.setToolTip("Download the selected model with Ollama")
+        self.download_button.clicked.connect(self.download)
+        self.more_button = QPushButton("+ GET MORE")
+        self.more_button.setToolTip("Download another model with Ollama")
+        self.more_menu = QMenu(self)
+        self.more_button.setMenu(self.more_menu)
+        self.status = QLabel()
+        self.status.setObjectName("dialogHelp")
+        self.status.setWordWrap(True)
+        self.status.hide()
+
+        row = QHBoxLayout()
+        row.addWidget(self.combo, 1)
+        row.addWidget(self.download_button)
+        row.addWidget(self.more_button)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addLayout(row)
+        layout.addWidget(self.status)
+
+    def set_models(self, installed: Sequence[str], current: str, empty_label: str | None = None,
+                   offline: bool = False) -> None:
+        """Fill the list with installed models. `empty_label` adds a first entry meaning "use the default".
+
+        `offline` means Ollama couldn't be reached, so nothing is known to be missing yet.
+        """
+        self.offline = offline
+        # Keep a saved "name" as written: rewriting it to "name:latest" would re-index every page.
+        self.installed = [current if current and name == f"{current}:latest" else name for name in installed]
+        self._empty_label = empty_label
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        if empty_label:
+            self.combo.addItem(empty_label, "")
+        for name in self.installed:
+            note = health_label(name) if self.cloud else ""
+            self.combo.addItem(f"{name}  ·  {note}" if note else name, name)
+        if current and not is_installed(current, self.installed):
+            missing = "NOT AVAILABLE" if self.cloud else "NOT INSTALLED"
+            unknown = "OFFLINE" if self.cloud else "OLLAMA OFFLINE"
+            self.combo.addItem(f"{current}  ·  {unknown if offline else missing}", current)
+        if self.combo.count() == 0:
+            self.combo.addItem("No models available" if self.cloud else "No models installed · use + GET MORE", "")
+            self.combo.model().item(0).setEnabled(False)
+        index = self.combo.findData(current) if current else (0 if empty_label else -1)
+        self.combo.setCurrentIndex(index if index >= 0 else 0)
+        self.combo.blockSignals(False)
+        self._build_menu()
+        self._refresh()
+
+    def set_cloud(self, cloud: bool) -> None:
+        self.cloud = cloud
+        self.more_button.setVisible(not cloud)
+
+    def _build_menu(self) -> None:
+        self.more_menu.clear()
+        self.more_button.setVisible(not self.cloud)
+        if self.cloud:
+            self.choices = {}
+            return
+        choices = download_choices(self.role, self.installed, self.hardware)
+        self.choices = {choice.name: choice for choice in choices}
+        for title, fits in (("FITS THIS MAC", True), ("LARGE FOR THIS MAC", False)):
+            group = [choice for choice in choices if choice.fits == fits]
+            if not group:
+                continue
+            self.more_menu.addSection(title)
+            for choice in group:
+                action = self.more_menu.addAction(f"{choice.name}  ·  {choice.size_gb:g} GB")
+                action.triggered.connect(lambda _checked=False, name=choice.name: self.download(name))
+        self.more_menu.addSeparator()
+        browse = self.more_menu.addAction("Other models: run  ollama pull <name>  in Terminal, then reopen")
+        browse.setEnabled(False)
+
+    def model_name(self) -> str:
+        """The exact Ollama name of the chosen entry ("" means the default)."""
+        name = self.combo.currentData()
+        return name if isinstance(name, str) else ""
+
+    def _refresh(self) -> None:
+        name = self.model_name()
+        download = ModelDownload.active.get((self.host, name)) if name else None
+        missing = bool(name) and not is_installed(name, self.installed) and not getattr(self, "offline", False)
+        choice = self.choices.get(name)
+        self.download_button.setVisible(missing and not self.cloud)
+        self.download_button.setEnabled(download is None)
+        self.download_button.setText(f"DOWNLOAD {choice.size_gb:g} GB" if choice else "DOWNLOAD")
+        if download:
+            self._follow(download)
+            self._show_status(download.latest)
+        elif missing and self.cloud:
+            self._show_status(f"Gemini doesn't offer {name} to this API key. Pick one from the list.")
+        elif missing:
+            self._show_status(f"{name} isn't installed, so it can't answer yet. Download it or pick an installed model.")
+        else:
+            self._show_status("")
+
+    def _show_status(self, text: str) -> None:
+        self.status.setText(text)
+        self.status.setVisible(bool(text))
+
+    def _follow(self, download: ModelDownload) -> None:
+        if download not in self._followed:
+            self._followed.add(download)
+            download.progress.connect(self._on_progress)
+            download.done.connect(self._on_done)
+
+    def download(self, name: str | None = None) -> None:
+        name = name or self.model_name()
+        if not name:
+            return
+        self._requested = name
+        self.download_button.setEnabled(False)
+        download = ModelDownload.start(self.host, name)
+        self._follow(download)
+        self._show_status(download.latest)
+
+    def _on_progress(self, text: str) -> None:
+        self._show_status(text)
+
+    def _on_done(self, name: str, error: str) -> None:
+        if error:
+            self._refresh()
+            self._show_status(error)
+            return
+        selected = name if self._requested == name else self.model_name()
+        self._requested = None
+        self.set_models([*self.installed, name], selected, self._empty_label, offline=False)
+        self.installed_changed.emit()
 
 
 class AgentEditorDialog(QDialog):
@@ -452,8 +663,12 @@ class AgentEditorDialog(QDialog):
         default_model: str,
         parent: QWidget | None = None,
         can_delete: bool = True,
+        host: str = DEFAULT_HOST,
+        provider_values: dict | None = None,
     ) -> None:
         super().__init__(parent)
+        provider_values = provider_values or {"provider": OLLAMA, "host": host}
+        cloud = provider_values.get("provider") == GEMINI
         self.agent = dict(agent or {})
         self.deleted = False
         self.setWindowTitle("Configure agent" if agent else "New agent")
@@ -465,18 +680,22 @@ class AgentEditorDialog(QDialog):
         self.name_input.setPlaceholderText("e.g. CS 354 Tutor")
         self.name_input.textChanged.connect(self._refresh_preview)
 
-        self.model_combo = QComboBox()
-        self.model_combo.setEditable(True)
-        self.model_combo.addItem(f"Default ({default_model})", "")
-        for name in installed_models:
-            if not is_embedding_model(name):
-                self.model_combo.addItem(name, name)
-        current_model = self.agent.get("model", "")
-        index = self.model_combo.findData(current_model)
-        if index >= 0:
-            self.model_combo.setCurrentIndex(index)
-        elif current_model:
-            self.model_combo.setEditText(current_model)
+        offline = False
+        if not installed_models:  # the app hasn't heard from the model service yet, so ask it now
+            try:
+                installed_models = fetch_models_by_role(make_client(provider_values))["chat"]
+            except OllamaError:
+                installed_models, offline = [], True
+        saved_model = self.agent.get("model", "")
+        if not model_fits(saved_model, provider_values.get("provider", OLLAMA)):
+            saved_model = ""  # e.g. a local model while on Gemini: start from the default
+        self.model_field = ModelField("chat", host, cloud=cloud)
+        self.model_field.set_models(
+            installed_models if cloud else models_by_role([{"name": name} for name in installed_models])["chat"],
+            saved_model,
+            f"Default ({default_model})",
+            offline=offline,
+        )
 
         self.creativity = QSlider(Qt.Orientation.Horizontal)
         self.creativity.setRange(0, 150)
@@ -490,7 +709,8 @@ class AgentEditorDialog(QDialog):
 
         self.notes_mode = QComboBox()
         for key, label in NOTES_MODES.items():
-            self.notes_mode.addItem(label, key)
+            if key != "off":  # the main chat always reads the selected notes; only the overlay skips them
+                self.notes_mode.addItem(label, key)
         self.notes_mode.setCurrentIndex(max(0, self.notes_mode.findData(self.agent.get("notes_mode", "strict"))))
         self.notes_help = QLabel()
         self.notes_help.setObjectName("dialogHelp")
@@ -510,8 +730,8 @@ class AgentEditorDialog(QDialog):
             swatch.setFixedSize(26, 26)
             swatch.setProperty("color", color)
             swatch.setStyleSheet(
-                f"QPushButton {{ background: {color}; border: 2px solid #07070a; padding: 0; }}"
-                "QPushButton:checked { border: 2px solid #f4f4f8; }"
+                f"QPushButton {{ background: {color}; border: 2px solid {COLORS['bg']}; padding: 0; }}"
+                f"QPushButton:checked {{ border: 2px solid {COLORS['white']}; }}"
             )
             swatch.setChecked(color.casefold() == accent.casefold())
             self.accent_group.addButton(swatch)
@@ -529,7 +749,7 @@ class AgentEditorDialog(QDialog):
         form = QFormLayout()
         form.setVerticalSpacing(12)
         form.addRow("Name", self.name_input)
-        form.addRow("Model", self.model_combo)
+        form.addRow("Model", self.model_field)
         form.addRow("Creativity", creativity_row)
         form.addRow("Lecture notes", self.notes_mode)
         form.addRow("", self.notes_help)
@@ -594,14 +814,10 @@ class AgentEditorDialog(QDialog):
             self.accept()
 
     def agent_data(self) -> dict:
-        model = self.model_combo.currentData()
-        typed = self.model_combo.currentText().strip()
-        if self.model_combo.findText(typed) < 0:  # a model name typed by hand
-            model = typed
         return {
             "id": self.agent.get("id"),
             "name": self.name_input.text().strip(),
-            "model": model or "",
+            "model": self.model_field.model_name(),
             "temperature": self.creativity.value() / 100,
             "notes_mode": self.notes_mode.currentData(),
             "reasoning": self.reasoning.isChecked(),
@@ -610,49 +826,115 @@ class AgentEditorDialog(QDialog):
         }
 
 
-class ModelSettingsDialog(QDialog):
-    """Pick the Ollama server and the default chat, embedding, and vision models."""
+class _ModelTester(QThread):
+    """Runs the Gemini model check off the UI thread."""
 
-    def __init__(self, values: dict, parent: QWidget | None = None) -> None:
+    done = Signal(object, str)  # results, error
+
+    def __init__(self, values: dict) -> None:
+        super().__init__()
+        self.values = values
+
+    def run(self) -> None:
+        try:
+            client = make_client(self.values)
+            client.include_unavailable = True  # re-test models an earlier check ruled out
+            names = [n for n in fetch_models_by_role(client, timeout=15)["chat"] if n.startswith("gemini")]
+            results = check_models(names, timeout=15, api_key=client.api_key, api_root=client.api_root)
+            self.done.emit(results, "")
+        except OllamaError as error:
+            self.done.emit({}, str(error))
+
+
+class ModelSettingsDialog(QDialog):
+    """Choose where the models run (Gemini API or Ollama) and the chat, embedding, and vision models."""
+
+    def __init__(self, values: dict, parent: QWidget | None = None, settings=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Local models")
-        self.resize(600, 520)
-        self.host_input = QLineEdit(values.get("host", ""))
-        self.chat_combo = QComboBox()
-        self.embed_combo = QComboBox()
-        self.vision_combo = QComboBox()
-        for combo in (self.chat_combo, self.embed_combo, self.vision_combo):
-            combo.setEditable(True)
-        self._values = values
+        self.setWindowTitle("Models")
+        self.resize(640, 620)
+        self._settings = settings
+        self._saved = {values.get("provider", GEMINI): dict(values)}
+        self.online: bool | None = None
+        self._roles: dict = {"chat": [], "vision": [], "embedding": []}
+
+        self.provider_combo = QComboBox()
+        for key in (GEMINI, OLLAMA):
+            self.provider_combo.addItem(PROVIDER_LABELS[key], key)
+        self.provider_combo.setCurrentIndex(max(0, self.provider_combo.findData(values.get("provider", GEMINI))))
+
+        saved_key = get_api_key()
+        self.key_input = QLineEdit()
+        self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_input.setPlaceholderText(f"Saved: {mask_key(saved_key)}" if saved_key else "Paste your Gemini API key")
+        key_link = QLabel(f'<a href="{KEY_URL}" style="color: {COLORS["cyan"]};">Get a free key</a>')
+        key_link.setOpenExternalLinks(True)
+        self.key_row = QWidget()
+        key_layout = QHBoxLayout(self.key_row)
+        key_layout.setContentsMargins(0, 0, 0, 0)
+        key_layout.addWidget(self.key_input, 1)
+        key_layout.addWidget(key_link)
+
+        self.host_input = QLineEdit(values.get("host", DEFAULT_HOST))
+        self.host_row = QWidget()
+        host_layout = QHBoxLayout(self.host_row)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.addWidget(self.host_input, 1)
+
+        host = self.host_input.text().strip()
+        self.chat_field = ModelField("chat", host)
+        self.embed_field = ModelField("embedding", host)
+        self.vision_field = ModelField("vision", host)
+        self.fields = (self.chat_field, self.embed_field, self.vision_field)
+        for field in self.fields:
+            field.installed_changed.connect(self.refresh_models)
+        self.handwriting = QCheckBox("Read handwriting on slides when indexing (one extra request per page)")
         self.status = QLabel()
         self.status.setObjectName("onlineStatus")
         self.status.setWordWrap(True)
         refresh = QPushButton("REFRESH")
         refresh.clicked.connect(self.refresh_models)
+        self.test_button = QPushButton("TEST MODELS")
+        self.test_button.setToolTip("Ask every chat model for a one-word reply, all at once, to see which are "
+                                    "answering right now and how fast")
+        self.test_button.clicked.connect(self.test_models)
+        self.use_best_button = QPushButton("USE RECOMMENDED")
+        self.use_best_button.clicked.connect(self.use_recommended)
+        self.use_best_button.hide()
+        self.test_status = QLabel()
+        self.test_status.setObjectName("dialogHelp")
+        self.test_status.setWordWrap(True)
+        self._recommended: str | None = None
+        self._tester: _ModelTester | None = None
 
-        help_text = QLabel(
-            "Everything runs on this Mac through Ollama — no API keys, nothing uploaded.\n\n"
-            "Recommended starting set (run in Terminal):\n"
-            f"  ollama pull {DEFAULT_CHAT_MODEL}          chat & quizzes\n"
-            f"  ollama pull {DEFAULT_EMBEDDING_MODEL}   search by meaning\n"
-            f"  ollama pull {DEFAULT_VISION_MODEL}      handwriting (optional)\n\n"
-            "On a 16 GB Mac, 7–9B models are the sweet spot. With 8 GB, try qwen3:4b and gemma3:4b. "
-            "Changing the embedding model re-indexes your pages the next time you press Index."
-        )
-        help_text.setObjectName("dialogHelp")
-        help_text.setWordWrap(True)
-        help_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.help_text = QLabel()
+        self.help_text.setObjectName("dialogHelp")
+        self.help_text.setWordWrap(True)
+        self.help_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         form = QFormLayout()
         form.setVerticalSpacing(12)
-        host_row = QHBoxLayout()
-        host_row.addWidget(self.host_input, 1)
-        host_row.addWidget(refresh)
-        form.addRow("Ollama server", host_row)
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(self.provider_combo, 1)
+        provider_row.addWidget(refresh)
+        form.addRow("Models run on", provider_row)
+        form.addRow("Gemini API key", self.key_row)
+        form.addRow("Ollama server", self.host_row)
+        self._key_label = form.labelForField(self.key_row)
+        self._host_label = form.labelForField(self.host_row)
         form.addRow("", self.status)
-        form.addRow("Default chat model", self.chat_combo)
-        form.addRow("Embedding model", self.embed_combo)
-        form.addRow("Vision model", self.vision_combo)
+        form.addRow("Default chat model", self.chat_field)
+        form.addRow("Embedding model", self.embed_field)
+        form.addRow("Vision model", self.vision_field)
+        form.addRow("", self.handwriting)
+        self.test_row = QWidget()
+        test_layout = QHBoxLayout(self.test_row)
+        test_layout.setContentsMargins(0, 0, 0, 0)
+        test_layout.addWidget(self.test_button)
+        test_layout.addWidget(self.use_best_button)
+        test_layout.addWidget(self.test_status, 1)
+        form.addRow("Model check", self.test_row)
+        self._test_label = form.labelForField(self.test_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -660,44 +942,324 @@ class ModelSettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
         layout.addLayout(form)
-        layout.addWidget(help_text, 1)
+        layout.addWidget(self.help_text, 1)
         layout.addWidget(buttons)
+        self.provider_combo.currentIndexChanged.connect(self._provider_changed)
+        self._apply_provider(initial=True)
+
+    # -- provider --------------------------------------------------------------------------
+    def provider(self) -> str:
+        return self.provider_combo.currentData()
+
+    def _values_for(self, provider: str) -> dict:
+        if provider not in self._saved:
+            if self._settings is not None:
+                from .providers import load_settings
+
+                self._saved[provider] = load_settings(self._settings, provider)
+            else:
+                from .providers import DEFAULTS
+
+                self._saved[provider] = {"provider": provider, "host": self.host_input.text(), **DEFAULTS[provider]}
+        return self._saved[provider]
+
+    def _provider_changed(self) -> None:
+        # remember what was picked for the provider we're leaving, then show the other one
+        previous = OLLAMA if self.provider() == GEMINI else GEMINI
+        if previous in self._saved and self.chat_field.combo.count():
+            self._saved[previous].update(self._picked())
+        for field in self.fields:
+            field.combo.clear()
+        self._apply_provider(initial=True)
+
+    def _apply_provider(self, initial: bool) -> None:
+        cloud = self.provider() == GEMINI
+        for widget in (self.key_row, self._key_label):
+            widget.setVisible(cloud)
+        for widget in (self.host_row, self._host_label):
+            widget.setVisible(not cloud)
+        for widget in (self.test_row, self._test_label):
+            widget.setVisible(cloud)
+        for field in self.fields:
+            field.set_cloud(cloud)
+        self.handwriting.setChecked(bool(self._values_for(self.provider()).get("handwriting", not cloud)))
+        if cloud:
+            self.help_text.setText(
+                "The models run on Google's servers, so your Mac stays fast. Each question sends the relevant "
+                "lecture pages (and, for the screen overlay, the screenshot) to Google. On the free tier Google "
+                "may use that content to improve its products and limits how many requests you can make per "
+                "minute and per day; a billed key avoids both.\n\n"
+                "The lists show the models your key can use. Flash models are fast and fine for studying; Pro "
+                "models reason better but are slower and have tighter free limits. Changing the embedding model "
+                "re-indexes your pages the next time you press Index."
+            )
+        else:
+            self.help_text.setText(
+                "Everything runs on this Mac through Ollama: no API key, and nothing is uploaded, but it needs a "
+                "lot of memory and slows other apps while it answers.\n\n"
+                "Each list shows the models installed on this Mac that can do that job. Use + GET MORE to "
+                "download another. Changing the embedding model re-indexes your pages the next time you press Index."
+            )
         self.refresh_models()
 
-    def refresh_models(self) -> None:
-        host = self.host_input.text().strip()
-        try:
-            client = OllamaClient(host)
-            names = sorted(model["name"] for model in client.list_models(timeout=2))
-            self.status.setText(f"◆ ONLINE · {len(names)} MODEL{'S' if len(names) != 1 else ''} INSTALLED")
-            self.status.setStyleSheet("color: #52e3a4;")
-        except OllamaError as error:
-            names = []
-            self.status.setText(f"◇ OFFLINE · {error}")
-            self.status.setStyleSheet("color: #ff5d73;")
-        chats = [n for n in names if not is_embedding_model(n)]
-        embeds = [n for n in names if is_embedding_model(n)]
-        self._fill(self.chat_combo, chats, self.chat_combo.currentText() or self._values.get("chat_model", DEFAULT_CHAT_MODEL))
-        self._fill(self.embed_combo, embeds, self.embed_combo.currentText() or self._values.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
-        vision_current = self.vision_combo.currentText() if self.vision_combo.count() else (
-            self._values.get("vision_model") or "None")
-        self._fill(self.vision_combo, ["None"] + chats, vision_current)
+    # -- models ----------------------------------------------------------------------------
+    def _client_values(self) -> dict:
+        values = {**self._values_for(self.provider()), "provider": self.provider(),
+                  "host": self.host_input.text().strip() or DEFAULT_HOST}
+        typed = self.key_input.text().strip()
+        if typed:
+            values["api_key"] = typed
+        return values
 
-    @staticmethod
-    def _fill(combo: QComboBox, names: list[str], current: str) -> None:
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItems(names)
-        if current and combo.findText(current) < 0:
-            combo.addItem(current)
-        combo.setCurrentText(current)
-        combo.blockSignals(False)
+    def refresh_models(self) -> None:
+        provider = self.provider()
+        values = self._client_values()
+        host = values["host"]
+        for field in self.fields:
+            field.host = host
+        try:
+            roles = fetch_models_by_role(make_client(values), timeout=8 if provider == GEMINI else 2)
+            self.online = True
+            count = len({*roles["chat"], *roles["embedding"]})
+            where = "AVAILABLE TO THIS KEY" if provider == GEMINI else "INSTALLED"
+            self.status.setText(f"◆ ONLINE · {count} MODEL{'S' if count != 1 else ''} {where}")
+            self.status.setStyleSheet(f"color: {COLORS['ok']};")
+        except OllamaError as error:
+            roles = {"chat": [], "vision": [], "embedding": []}
+            self.online = False
+            self.status.setText(f"◇ {error}")
+            self.status.setStyleSheet(f"color: {COLORS['bad']};")
+        self._roles = roles
+        saved = self._values_for(provider)
+        initial = self.chat_field.combo.count() == 0
+        chat = saved.get("chat_model", "") if initial else self.chat_field.model_name()
+        embed = saved.get("embedding_model", "") if initial else self.embed_field.model_name()
+        vision = saved.get("vision_model", "") if initial else self.vision_field.model_name()
+        if provider == GEMINI and self.online:  # aliases or retired names: fall back to what the key offers
+            if roles["chat"] and chat not in roles["chat"]:
+                chat = best_model(roles["chat"], "chat")
+            if roles["embedding"] and embed not in roles["embedding"]:
+                embed = best_model(roles["embedding"], "embedding")
+            if vision and roles["vision"] and vision not in roles["vision"]:
+                vision = chat
+        offline = not self.online
+        self.chat_field.set_models(roles["chat"], chat, offline=offline)
+        self.embed_field.set_models(roles["embedding"], embed, offline=offline)
+        self.vision_field.set_models(roles["vision"], vision, "None · skip handwriting and screen reading",
+                                     offline=offline)
+
+    def chat_models(self) -> list[str]:
+        return list(self._roles["chat"])
+
+    # -- model check (Gemini) --------------------------------------------------------------
+    def test_models(self) -> None:
+        """Probe every chat model in the background; annotate the dropdowns and recommend one."""
+        if self._tester is not None:
+            return
+        values = self._client_values()
+        self.test_button.setEnabled(False)
+        self.use_best_button.hide()
+        self.test_status.setText("Asking every model for a one-word reply…")
+        self._tester = _ModelTester(values)
+        self._tester.done.connect(self._tested)
+        self._tester.start()
+
+    def _tested(self, results: object, error: str) -> None:
+        self._tester = None
+        self.test_button.setEnabled(True)
+        if error:
+            self.test_status.setText(f"◇ {error}")
+            return
+        if self._settings is not None:
+            from .providers import save_health
+
+            save_health(self._settings, results)
+        working = [n for n, r in results.items() if r["kind"] == "ok"]
+        self._recommended = recommend(results)
+        summary = f"✓ {len(working)} answering · ✗ {len(results) - len(working)} not"
+        if self._recommended:
+            summary += f" · recommended: {self._recommended}"
+            self.use_best_button.show()
+        else:
+            summary += ". Nothing answered: Google may be overloaded, or the daily quota is used up."
+        self.test_status.setText(summary)
+        self.refresh_models()  # re-list: hides models the key can't use and shows ✓/✗ next to the rest
+
+    def done(self, result: int) -> None:  # noqa: D401 - QDialog.done: closing (Save, Cancel, or Esc)
+        if self._tester is not None:
+            self.test_status.setText("Finishing the model check…")
+            self._tester.wait(20000)  # a running QThread must not be destroyed with the dialog
+        super().done(result)
+
+    def use_recommended(self) -> None:
+        if not self._recommended:
+            return
+        for field in (self.chat_field, self.vision_field):
+            index = field.combo.findData(self._recommended)
+            if index >= 0:
+                field.combo.setCurrentIndex(index)
+        self.test_status.setText(f"{self._recommended} will be the default for chat and screen reading. Press Save.")
+
+    def _picked(self) -> dict:
+        return {
+            "chat_model": self.chat_field.model_name(),
+            "embedding_model": self.embed_field.model_name(),
+            "vision_model": self.vision_field.model_name(),
+            "handwriting": self.handwriting.isChecked(),
+        }
 
     def values(self) -> dict:
-        vision = self.vision_combo.currentText().strip()
+        saved = self._values_for(self.provider())
+        picked = self._picked()
         return {
+            "provider": self.provider(),
             "host": self.host_input.text().strip(),
-            "chat_model": self.chat_combo.currentText().strip() or DEFAULT_CHAT_MODEL,
-            "embedding_model": self.embed_combo.currentText().strip() or DEFAULT_EMBEDDING_MODEL,
-            "vision_model": "" if vision.casefold() in {"", "none"} else vision,
+            "api_key": self.key_input.text().strip(),
+            "chat_model": picked["chat_model"] or saved.get("chat_model") or DEFAULT_CHAT_MODEL,
+            "embedding_model": picked["embedding_model"] or saved.get("embedding_model") or DEFAULT_EMBEDDING_MODEL,
+            "vision_model": picked["vision_model"],
+            "handwriting": picked["handwriting"],
         }
+
+
+# ---------------------------------------------------------------------------------------------
+# Overlay shortcuts
+# ---------------------------------------------------------------------------------------------
+
+DEFAULT_SHORTCUTS = {"toggle": "cmd+shift+space", "read": "cmd+shift+return"}
+
+_SHIFTED = {"?": "/", "|": "\\", "<": ",", ">": ".", ":": ";", '"': "'", "~": "`", "_": "-", "+": "=",
+            "{": "[", "}": "]", "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
+            "*": "8", "(": "9", ")": "0"}
+
+
+def shortcut_from_sequence(sequence: QKeySequence, mac: bool = sys.platform == "darwin") -> Shortcut | None:
+    """Turn what QKeySequenceEdit recorded into a Shortcut (None if empty or a key we can't bind)."""
+    if sequence.isEmpty():
+        return None
+    combination = sequence[0]
+    modifiers = combination.keyboardModifiers()
+    names = set()
+    # Qt on macOS reports ⌘ as ControlModifier and ⌃ as MetaModifier.
+    command_flag, control_flag = ((Qt.KeyboardModifier.ControlModifier, Qt.KeyboardModifier.MetaModifier) if mac
+                                  else (Qt.KeyboardModifier.MetaModifier, Qt.KeyboardModifier.ControlModifier))
+    if modifiers & command_flag:
+        names.add("cmd")
+    if modifiers & control_flag:
+        names.add("control")
+    if modifiers & Qt.KeyboardModifier.AltModifier:
+        names.add("option")
+    if modifiers & Qt.KeyboardModifier.ShiftModifier:
+        names.add("shift")
+    key_text = QKeySequence(combination.key()).toString(QKeySequence.SequenceFormat.PortableText).casefold()
+    key_text = {"enter": "return", "backtab": "tab"}.get(key_text, _SHIFTED.get(key_text, key_text))
+    if key_text not in KEY_CODES:
+        return None
+    return Shortcut(key_text, frozenset(names))
+
+
+class ShortcutField(QWidget):
+    """Press a key combination to record it; OFF disables it and RESET restores the default."""
+
+    def __init__(self, current: str, default: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.default = default
+        self.value = current
+        self.recorder = QKeySequenceEdit()
+        self.recorder.setMaximumSequenceLength(1)
+        self.recorder.editingFinished.connect(self._recorded)
+        self.label = QLabel()
+        self.label.setMinimumWidth(84)
+        self.label.setStyleSheet(f"color: {COLORS['cyan']}; font-size: 15px; font-weight: 700;")
+        off = QPushButton("OFF")
+        off.clicked.connect(lambda: self.set_value("off"))
+        reset = QPushButton("RESET")
+        reset.clicked.connect(lambda: self.set_value(self.default))
+        self.error = QLabel()
+        self.error.setObjectName("dialogHelp")
+        self.error.setWordWrap(True)
+        self.error.hide()
+        row = QHBoxLayout()
+        row.addWidget(self.label)
+        row.addWidget(self.recorder, 1)
+        row.addWidget(off)
+        row.addWidget(reset)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(row)
+        layout.addWidget(self.error)
+        self.set_value(current)
+
+    def set_value(self, text: str) -> None:
+        self.value = text
+        self.label.setText(shortcut_label(text))
+        self.recorder.blockSignals(True)
+        self.recorder.clear()
+        self.recorder.blockSignals(False)
+        self.error.hide()
+
+    def _recorded(self) -> None:
+        shortcut = shortcut_from_sequence(self.recorder.keySequence())
+        self.recorder.blockSignals(True)
+        self.recorder.clear()
+        self.recorder.blockSignals(False)
+        if shortcut is None:
+            self._show_error("That key can't be used as a global shortcut. Try a letter, Space, Return or F-key.")
+            return
+        try:
+            shortcut.validate()
+        except ValueError as problem:
+            self._show_error(str(problem))
+            return
+        self.set_value(shortcut.text)
+
+    def _show_error(self, text: str) -> None:
+        self.error.setText(text)
+        self.error.show()
+
+
+class ShortcutsDialog(QDialog):
+    """Choose the global shortcuts for the screen overlay."""
+
+    def __init__(self, values: dict, failed: Sequence[str] = (), parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Overlay shortcuts")
+        self.resize(520, 300)
+        self.toggle_field = ShortcutField(values.get("toggle", DEFAULT_SHORTCUTS["toggle"]), DEFAULT_SHORTCUTS["toggle"])
+        self.read_field = ShortcutField(values.get("read", DEFAULT_SHORTCUTS["read"]), DEFAULT_SHORTCUTS["read"])
+        form = QFormLayout()
+        form.setVerticalSpacing(14)
+        form.addRow("Show / hide overlay", self.toggle_field)
+        form.addRow("Read screen now", self.read_field)
+        help_text = QLabel(
+            "Click a field and press the keys you want. These work from any app while Cortex is open. "
+            "Include ⌘, ⌃ or ⌥. Avoid ⌘Space (Spotlight) and ⌃Space / ⌃⌥Space (macOS input-source switching)."
+        )
+        help_text.setObjectName("dialogHelp")
+        help_text.setWordWrap(True)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.addLayout(form)
+        if failed:
+            warning = QLabel(
+                "Another app already uses " + " and ".join(failed) + ", so Cortex couldn't claim it. Pick another one."
+            )
+            warning.setWordWrap(True)
+            warning.setStyleSheet(f"color: {COLORS['warn']};")
+            layout.addWidget(warning)
+        layout.addWidget(help_text)
+        layout.addStretch(1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _accept_if_valid(self) -> None:
+        values = self.values()
+        if values["toggle"] != "off" and values["toggle"] == values["read"]:
+            QMessageBox.information(self, "Same shortcut twice", "Pick different keys for the two shortcuts.")
+            return
+        self.accept()
+
+    def values(self) -> dict:
+        return {"toggle": self.toggle_field.value, "read": self.read_field.value}

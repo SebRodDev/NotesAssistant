@@ -106,7 +106,8 @@ class FakeServerTests(unittest.TestCase):
         request = self.fake.requests[-1]
         self.assertTrue(request["think"])
         self.assertIn("Be brief.", request["messages"][0]["content"])
-        self.assertIn("[S1]", request["messages"][-1]["content"])
+        self.assertIn("[S1]", request["messages"][0]["content"])  # slides lead, right after the instructions
+        self.assertEqual(request["messages"][-1]["content"], "Question: What is priority inversion?")
 
     def test_off_mode_sends_no_notes_and_history_is_kept(self) -> None:
         self.models.stream_answer("hi", [], notes_mode="off", history=[("user", "earlier"), ("assistant", "reply")])
@@ -143,6 +144,19 @@ class FakeServerTests(unittest.TestCase):
     def test_missing_model_has_pull_instructions(self) -> None:
         with self.assertRaisesRegex(OllamaError, "ollama pull llama9"):
             StudyModels(OllamaClient(self.fake.host), chat_model="llama9").stream_answer("q", [], notes_mode="off")
+
+    def test_pull_reports_progress(self) -> None:
+        updates = []
+        OllamaClient(self.fake.host).pull("qwen3:4b", updates.append)
+        self.assertEqual(updates, ["Downloading qwen3:4b: 50% of 0.0 GB…"])
+
+    def test_pull_errors_are_raised(self) -> None:
+        with self.assertRaisesRegex(OllamaError, "file does not exist"):
+            OllamaClient(self.fake.host).pull("no-such-model")
+
+    def test_pull_that_ends_early_is_an_error(self) -> None:
+        with self.assertRaisesRegex(OllamaError, "stopped before it finished"):
+            OllamaClient(self.fake.host).pull("cut-off-model")
 
     def test_offline_server_is_explained(self) -> None:
         with self.assertRaisesRegex(OllamaUnavailable, "Open the Ollama app"):

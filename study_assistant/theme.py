@@ -1,13 +1,15 @@
-"""Dark, terminal-inspired visual theme."""
+"""Dark cyberpunk theme: neutral near-black base, electric cyan as the main neon, acid yellow for the
+primary action, and magenta only in small touches."""
 
 from __future__ import annotations
 
 from PySide6.QtGui import QColor, QFont, QFontDatabase
 
 APP_NAME = "Cortex"
-APP_TAGLINE = "LOCAL NOTES INTERFACE // v2.0"
+APP_TAGLINE = "NOTES LINK INTERFACE // v2.1"
 
 COLORS = {
+    # Neutral greys and near-blacks: no colour cast, so the accents stand out.
     "bg": "#07070a",
     "panel": "#0c0c11",
     "raised": "#111118",
@@ -19,11 +21,16 @@ COLORS = {
     "dim": "#5b5b68",
     "ok": "#52e3a4",
     "warn": "#f5c451",
-    "bad": "#ff5d73",
+    "bad": "#ff6b3d",  # orange-red, so errors don't read as the pink highlight
     "white": "#f4f4f8",
+    "cyan": "#00e5ff",  # main neon: focus, selection, links, meters
+    "yellow": "#fcee0a",  # acid yellow: the one primary action (Send)
+    "pink": "#ff2e97",  # magenta: rare highlights only
+    "purple": "#b14cff",
 }
 
-ACCENTS = ["#9b87f5", "#2ee6d6", "#ff6ac1", "#f5c451", "#52e3a4", "#e8e8ee"]
+# Agent portrait colors. The interface highlights stay cyan whichever agent is active.
+ACCENTS = ["#00e5ff", "#fcee0a", "#ff2e97", "#39ff88", "#b14cff", "#e8e8ee"]
 
 _MONO_CANDIDATES = ["JetBrains Mono", "SF Mono", "Menlo", "IBM Plex Mono", "Consolas", "DejaVu Sans Mono"]
 _SANS_CANDIDATES = ["Inter", "SF Pro Text", ".AppleSystemUIFont", "Helvetica Neue", "Segoe UI", "DejaVu Sans"]
@@ -70,8 +77,11 @@ def stylesheet(accent: str) -> str:
     c = COLORS
     mono = mono_family()
     sans = sans_family()
-    accent_soft = with_alpha(accent, 0.14)
+    # `accent` (the agent's color) is only used for its portrait; the chrome is always cyan.
+    accent = c["cyan"]
+    accent_soft = with_alpha(accent, 0.12)
     accent_mid = with_alpha(accent, 0.45)
+    neon = f"qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {c['cyan']}, stop:1 {c['pink']})"
     return f"""
     QWidget {{ color: {c['text']}; font-family: "{sans}"; font-size: 13px; }}
     QMainWindow, QDialog {{ background: {c['bg']}; }}
@@ -83,15 +93,20 @@ def stylesheet(accent: str) -> str:
     #header {{ background: {c['bg']}; border-bottom: 1px solid {c['border']}; }}
 
     #brandTitle {{ font-family: "{mono}"; font-size: 20px; letter-spacing: 9px; color: {c['white']}; }}
-    #brandRule {{ background: {c['white']}; }}
+    #brandRule {{ background: {neon}; }}
     #brandTag, #monoMuted, #sectionHeading, #footerNote, #statLabel, #hintText {{
         font-family: "{mono}"; color: {c['muted']}; font-size: 10px; letter-spacing: 1.5px; }}
     #sectionHeading {{ color: {c['dim']}; font-size: 10px; letter-spacing: 2px; }}
     #onlineStatus {{ font-family: "{mono}"; font-size: 10px; letter-spacing: 1.5px; }}
     #statValue {{ font-family: "{mono}"; color: {c['white']}; font-size: 10px; font-weight: 700; }}
+    QComboBox#modelPicker {{ font-family: "{mono}"; color: {c['white']}; font-size: 10px; font-weight: 700;
+        background: transparent; border: 1px solid {c['border']}; padding: 1px 6px; min-height: 16px; }}
+    QComboBox#modelPicker:hover {{ border-color: {accent}; }}
+    QComboBox#modelPicker:disabled {{ color: {c['muted']}; }}
     #agentTitle {{ font-family: "{mono}"; font-size: 16px; letter-spacing: 3px; color: {c['white']}; }}
     #panelName {{ font-family: "{mono}"; font-size: 18px; letter-spacing: 5px; color: {c['white']}; }}
     #panelSubject {{ font-family: "{mono}"; font-size: 9px; letter-spacing: 2px; color: {c['muted']}; }}
+    #linkCard {{ background: {c['panel']}; border: 1px solid {accent}; }}
     #panelPrompt {{ color: {c['muted']}; font-size: 12px; line-height: 150%; }}
     #scopeChip {{ font-family: "{mono}"; font-size: 10px; letter-spacing: 1.5px; color: {accent};
         border: 1px solid {accent_mid}; background: {accent_soft}; padding: 3px 8px; }}
@@ -102,9 +117,10 @@ def stylesheet(accent: str) -> str:
     QPushButton:pressed {{ background: {accent_mid}; }}
     QPushButton:disabled {{ color: {c['dim']}; border-color: {c['border']}; }}
     QPushButton:checked {{ border-color: {accent}; color: {accent}; background: {accent_soft}; }}
-    #sendButton {{ background: {c['white']}; color: #000; border: none; padding: 10px 18px; }}
-    #sendButton:hover {{ background: {accent}; color: #000; }}
+    #sendButton {{ background: {c['yellow']}; color: #000; border: none; padding: 10px 18px; }}
+    #sendButton:hover {{ background: {c['cyan']}; color: #000; }}
     #sendButton:disabled {{ background: {c['border_hi']}; color: {c['dim']}; }}
+    #headerButton {{ padding: 6px 8px; letter-spacing: 1px; }}
     #ghostButton {{ border: none; color: {c['muted']}; padding: 4px 6px; }}
     #ghostButton:hover {{ color: {c['white']}; background: transparent; }}
     #modeButton {{ border: 1px solid {c['border']}; color: {c['muted']}; padding: 5px 9px; }}
@@ -112,12 +128,16 @@ def stylesheet(accent: str) -> str:
     #sourceLink {{ font-family: "{mono}"; font-size: 10px; font-weight: 400; letter-spacing: 0.5px; text-align: left;
         color: {accent}; border: 1px solid {c['border']}; background: {c['raised']}; padding: 5px 9px; }}
     #sourceLink:hover {{ border-color: {accent}; }}
+    #sourcesToggle {{ font-family: "{mono}"; font-size: 10px; letter-spacing: 1.5px; text-align: left;
+        color: {accent}; border: none; background: transparent; padding: 4px 0px; }}
+    #sourcesToggle:hover {{ color: {c['white']}; }}
     #chipButton {{ font-weight: 400; color: {c['muted']}; border: 1px solid {c['border']};
         background: {c['raised']}; padding: 4px 9px; }}
 
     #agentCard {{ background: transparent; border: 1px solid transparent; }}
     #agentCard:hover {{ border: 1px solid {c['border_hi']}; }}
-    #agentCard[active="true"] {{ background: {c['card']}; border: 1px solid {c['border_hi']}; }}
+    #agentCard[active="true"] {{ background: {c['card']}; border: 1px solid {c['border_hi']};
+        border-left: 2px solid {c['cyan']}; }}
     #agentName {{ font-size: 13px; font-weight: 600; color: {c['white']}; }}
     #agentModel {{ font-family: "{mono}"; font-size: 10px; color: {c['muted']}; }}
     #tag {{ font-family: "{mono}"; font-size: 8px; letter-spacing: 1px; font-weight: 700; color: {c['muted']};
@@ -128,8 +148,8 @@ def stylesheet(accent: str) -> str:
     #messageHeading {{ font-family: "{mono}"; font-size: 10px; letter-spacing: 2px; font-weight: 700; color: {c['white']}; }}
     #messageRule {{ background: {c['border']}; }}
     #retrievalLine {{ font-family: "{mono}"; font-size: 10px; color: {c['muted']}; }}
-    #thinkingText {{ color: {c['muted']}; font-size: 12px; border-left: 2px solid {c['border_hi']}; padding-left: 10px; }}
-    #messageBody {{ font-size: 14px; color: {c['text']}; }}
+    #thinkingText {{ color: {c['muted']}; font-size: 12px; border-left: 2px solid {c['pink']}; padding-left: 10px; }}
+    #messageBody {{ font-size: 15px; color: {c['text']}; }}
 
     #composer {{ background: {c['panel']}; border: 1px solid {c['border_hi']}; }}
     #composer[focused="true"] {{ border: 1px solid {accent_mid}; }}
@@ -148,9 +168,12 @@ def stylesheet(accent: str) -> str:
     QHeaderView::section {{ background: {c['panel']}; color: {c['muted']}; border: none; padding: 5px;
         font-family: "{mono}"; font-size: 10px; letter-spacing: 1px; }}
 
-    QTabBar::tab {{ font-family: "{mono}"; font-size: 10px; letter-spacing: 2px; font-weight: 700; color: {c['muted']};
-        background: transparent; padding: 9px 14px; border: none; border-bottom: 2px solid transparent; }}
-    QTabBar::tab:selected {{ color: {c['white']}; border-bottom: 2px solid {c['white']}; }}
+    /* no letter-spacing here: Qt doesn't count it when sizing tabs, so macOS cut the labels off */
+    QTabBar::tab {{ font-family: "{mono}"; font-size: 12px; font-weight: 700; color: {c['text']};
+        background: transparent; padding: 10px 16px; min-width: 70px; border: none;
+        border-bottom: 2px solid transparent; }}
+    QTabBar::tab:hover {{ color: {c['white']}; }}
+    QTabBar::tab:selected {{ color: {c['white']}; border-bottom: 2px solid {c['cyan']}; }}
     QTabWidget::pane {{ border: none; border-top: 1px solid {c['border']}; }}
 
     #pdfPreview {{ background: {c['raised']}; border: 1px solid {c['border']}; color: {c['muted']}; }}
@@ -164,6 +187,7 @@ def stylesheet(accent: str) -> str:
     QScrollArea {{ background: transparent; border: none; }}
     QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px; }}
     QScrollBar::handle:vertical {{ background: {c['border_hi']}; min-height: 30px; }}
+    QScrollBar::handle:vertical:hover {{ background: {c['cyan']}; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical, QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ height: 0; background: none; }}
     QStatusBar {{ background: {c['panel']}; color: {c['muted']}; font-family: "{mono}"; font-size: 10px; border-top: 1px solid {c['border']}; }}
     QMessageBox QLabel {{ color: {c['text']}; }}

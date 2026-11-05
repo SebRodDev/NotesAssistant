@@ -5,11 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "purdue-study-assistant"
 version = "2.0.0"
-description = "Cortex: an offline, Ollama-powered chat interface for your lecture notes"
+description = "Cortex: a cyberpunk study chat for your lecture notes, on the Gemini API or a local Ollama"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6-Essentials>=6.7,<7",
     "PyMuPDF>=1.24,<2",
+    "matplotlib>=3.8,<4",
+    "Pygments>=2.17,<3",
 ]
 
 [project.optional-dependencies]

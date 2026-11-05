@@ -17,13 +17,15 @@ def database_path() -> Path:
     return data_dir / "study_assistant.sqlite3"
 
 
+DEFAULT_ACCENT = "#00e5ff"
+
 DEFAULT_AGENTS = [
     {
         "name": "Tutor",
         "temperature": 0.2,
         "notes_mode": "strict",
         "reasoning": False,
-        "accent": "#9b87f5",
+        "accent": DEFAULT_ACCENT,
         "system_prompt": (
             "You are Tutor, a precise study assistant for a Purdue CS student. Answer clearly and directly "
             "from the student's lecture notes, keep answers short unless asked for detail, and cite the pages "
@@ -35,7 +37,7 @@ DEFAULT_AGENTS = [
         "temperature": 0.6,
         "notes_mode": "blend",
         "reasoning": True,
-        "accent": "#2ee6d6",
+        "accent": "#fcee0a",
         "system_prompt": (
             "You are Explainer, a patient TA. Start from what the lecture notes say, then build intuition with "
             "a small example or analogy. Walk through steps for algorithms and proofs. Flag anything you add "
@@ -45,7 +47,7 @@ DEFAULT_AGENTS = [
     {
         "name": "Free chat",
         "temperature": 0.8,
-        "notes_mode": "off",
+        "notes_mode": "blend",
         "reasoning": False,
         "accent": "#e8e8ee",
         "system_prompt": "You are a helpful, friendly assistant. Answer clearly and directly, and keep answers short unless asked for detail.",
@@ -62,6 +64,19 @@ _SEARCH_STOP_WORDS = {
 
 
 MAX_LEARNED_MEMORIES = 200
+
+
+def clean_model_name(text: str) -> str:
+    """Reduce a model dropdown label to the name Ollama accepts.
+
+    "Default (qwen3:4b)" and "qwen3:4b  ·  2.5 GB" are display text. Ollama rejects them with
+    HTTP 400 "invalid model name". Plain names pass through unchanged.
+    """
+    text = text.strip()
+    default_label = re.fullmatch(r"default \((.+)\)", text, re.IGNORECASE)
+    if default_label:
+        text = default_label[1]
+    return text.split("·")[0].strip()
 
 
 class Library:
@@ -197,7 +212,7 @@ class Library:
                 temperature REAL NOT NULL DEFAULT 0.3,
                 notes_mode TEXT NOT NULL DEFAULT 'strict',
                 reasoning INTEGER NOT NULL DEFAULT 0,
-                accent TEXT NOT NULL DEFAULT '#9b87f5',
+                accent TEXT NOT NULL DEFAULT '#00e5ff',
                 system_prompt TEXT NOT NULL DEFAULT '',
                 position INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -218,6 +233,35 @@ class Library:
                     (agent["name"], agent["temperature"], agent["notes_mode"], int(agent["reasoning"]),
                      agent["accent"], agent["system_prompt"], position),
                 )
+        if version < 6:
+            # v6: pink/purple theme. Retired swatches move to their replacements, and the built-in agents
+            # get their new colors unless they were recolored. Other chosen colors are left alone.
+            for old, new in (("#9b87f5", DEFAULT_ACCENT), ("#ff6ac1", "#ff2e97")):
+                self.connection.execute("UPDATE agents SET accent=? WHERE accent=?", (new, old))
+            for name, old, new in (("Explainer", "#2ee6d6", "#ff2e97"), ("Free chat", "#e8e8ee", "#f06bff")):
+                self.connection.execute("UPDATE agents SET accent=? WHERE name=? AND accent=?", (new, name, old))
+            self.connection.execute("PRAGMA user_version = 6")
+        if version < 7:
+            # v7: dropdown labels were sometimes saved as an agent's model, which Ollama rejects. Keep the
+            # model the label named rather than clearing it, since the default may not be installed.
+            for agent_id, model in self.connection.execute("SELECT id, model FROM agents").fetchall():
+                if clean_model_name(model) != model:
+                    self.connection.execute(
+                        "UPDATE agents SET model=? WHERE id=?", (clean_model_name(model), agent_id)
+                    )
+            self.connection.execute("PRAGMA user_version = 7")
+        if version < 8:
+            # v8: cyberpunk palette (cyan-led). Built-in agents still on their v6 colors move to the new
+            # ones; any agent the user recolored keeps its color.
+            for name, old, new in (("Tutor", "#b14cff", DEFAULT_ACCENT), ("Explainer", "#ff2e97", "#fcee0a"),
+                                   ("Free chat", "#f06bff", "#e8e8ee")):
+                self.connection.execute("UPDATE agents SET accent=? WHERE name=? AND accent=?", (new, name, old))
+            self.connection.execute("PRAGMA user_version = 8")
+        if version < 9:
+            # v9: the main chat always answers from the selected notes, so "no notes" agents use notes plus
+            # general knowledge instead (the screen overlay is where notes are left out).
+            self.connection.execute("UPDATE agents SET notes_mode='blend' WHERE notes_mode='off'")
+            self.connection.execute("PRAGMA user_version = 9")
         self.connection.commit()
 
     # -- agents ------------------------------------------------------------------------------
@@ -232,14 +276,14 @@ class Library:
         name = str(agent.get("name", "")).strip()
         if not name:
             raise ValueError("An agent needs a name.")
-        if agent.get("notes_mode") not in {"strict", "blend", "off"}:
+        if agent.get("notes_mode") not in {"strict", "blend"}:
             raise ValueError("Unknown notes mode.")
         temperature = float(agent.get("temperature", 0.3))
         if not math.isfinite(temperature) or not 0 <= temperature <= 2:
             raise ValueError("Creativity must be between 0 and 2.")
         values = (
             name, str(agent.get("model") or "").strip(), temperature, agent["notes_mode"],
-            int(bool(agent.get("reasoning"))), str(agent.get("accent") or "#9b87f5"),
+            int(bool(agent.get("reasoning"))), str(agent.get("accent") or DEFAULT_ACCENT),
             str(agent.get("system_prompt") or "").strip(),
         )
         with self.connection:
@@ -330,6 +374,55 @@ class Library:
             "indexed_pages": row["indexed_pages"] or 0,
             "pending_visual_pages": row["pending_visual_pages"] or 0,
         }
+
+    def lecture_pages(self, class_name: str, lecture_name: str) -> list[dict]:
+        """Every page of one lecture, in order (a lecture can span several PDFs)."""
+        return self.scope_pages(class_name, lecture_name)
+
+    def scope_pages(self, class_name: str | None, lecture_name: str | None = None) -> list[dict]:
+        """Every page in a lecture, a whole course (lecture None), or the library (both None), in the
+        order the material was taught: course, then lecture in import order, then page."""
+        where, parameters = [], []
+        if class_name is not None:
+            where.append("d.class_name=?")
+            parameters.append(class_name)
+        if lecture_name is not None:
+            where.append("d.lecture_name=?")
+            parameters.append(lecture_name)
+        return [dict(row) for row in self.connection.execute(
+            f"""SELECT p.id, p.page_number, p.text, p.visual_text, d.class_name, d.lecture_name, d.file_path
+                FROM pages p JOIN documents d ON d.id=p.document_id
+                JOIN (SELECT class_name, lecture_name, MIN(imported_at || printf('%010d', id)) AS taught
+                      FROM documents GROUP BY class_name, lecture_name) l
+                  ON l.class_name=d.class_name AND l.lecture_name=d.lecture_name
+                {"WHERE " + " AND ".join(where) if where else ""}
+                ORDER BY d.class_name, l.taught, d.imported_at, d.id, p.page_number""",
+            parameters,
+        )]
+
+    def scope_status(self, class_name: str | None, lecture_name: str | None, model: str) -> dict[str, int]:
+        """What's stored for a course, a lecture, or everything (None): PDFs, lectures, pages, pages with
+        any text, and pages indexed for meaning search with `model`. Used to explain empty answers."""
+        where, parameters = [], [model]
+        if class_name is not None:
+            where.append("d.class_name=?")
+            parameters.append(class_name)
+        if lecture_name is not None:
+            where.append("d.lecture_name=?")
+            parameters.append(lecture_name)
+        row = self.connection.execute(
+            f"""SELECT COUNT(DISTINCT d.id) AS documents,
+                       COUNT(DISTINCT d.class_name || char(31) || d.lecture_name) AS lectures,
+                       COUNT(p.id) AS pages,
+                       SUM(CASE WHEN TRIM(COALESCE(p.text, '')) != '' OR TRIM(COALESCE(p.visual_text, '')) != ''
+                           THEN 1 ELSE 0 END) AS text_pages,
+                       SUM(CASE WHEN e.page_id IS NOT NULL THEN 1 ELSE 0 END) AS indexed
+                FROM documents d LEFT JOIN pages p ON p.document_id=d.id
+                LEFT JOIN page_embeddings e ON e.page_id=p.id AND e.model=?
+                {"WHERE " + " AND ".join(where) if where else ""}""",
+            parameters,
+        ).fetchone()
+        return {key: int(row[key] or 0) for key in ("documents", "lectures", "pages", "text_pages", "indexed")}
 
     def pages_for_scopes(self, scopes: list[tuple[str, str]], limit: int = 16) -> list[dict]:
         """Select pages spread across chosen lectures for quiz generation."""

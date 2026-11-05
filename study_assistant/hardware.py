@@ -22,8 +22,13 @@ CHAT_CATALOG: tuple[tuple[str, float], ...] = (
 )
 VISION_CATALOG: tuple[tuple[str, float], ...] = (
     ("qwen3.6:35b", 23), ("qwen3.6:27b", 19), ("gemma4:31b", 20), ("gemma4:26b", 18), ("gemma4:12b", 8.0),
-    ("qwen3-vl:8b", 6.2), ("qwen3-vl:4b", 3.3), ("gemma3:4b", 3.4), ("qwen3-vl:2b", 1.9),
+    ("qwen3-vl:8b", 6.2), ("qwen2.5vl:7b", 6.0), ("qwen3-vl:4b", 3.3), ("gemma3:4b", 3.4), ("qwen3-vl:2b", 1.9),
 )
+EMBEDDING_CATALOG: tuple[tuple[str, float], ...] = (
+    ("nomic-embed-text", 0.27), ("embeddinggemma", 0.62), ("mxbai-embed-large", 0.67),
+    ("snowflake-arctic-embed", 0.67), ("bge-m3", 1.2),
+)
+CATALOGS = {"chat": CHAT_CATALOG, "vision": VISION_CATALOG, "embedding": EMBEDDING_CATALOG}
 
 # Below this the notes, chat history, and answer no longer fit together in one prompt.
 MIN_USEFUL_CONTEXT = 8192
@@ -130,6 +135,29 @@ def plan_models(installed: Sequence[dict], hardware: Hardware, embedding_model: 
     return ModelPlan(picks["chat"], picks["vision"], tuple(dict.fromkeys(upgrades)))
 
 
+@dataclass(frozen=True)
+class ModelChoice:
+    name: str
+    size_gb: float
+    fits: bool
+
+
+def is_installed(name: str, installed: Sequence[str]) -> bool:
+    return name in installed or f"{name}:latest" in installed
+
+
+def download_choices(role: str, installed: Sequence[str], hardware: Hardware) -> list[ModelChoice]:
+    """Catalog models for a role that aren't installed yet.
+
+    Ones that fit this computer come first, best first; the rest follow, closest to fitting first.
+    """
+    choices = [
+        ModelChoice(name, size, hardware.fits(size * GB))
+        for name, size in CATALOGS[role] if not is_installed(name, installed)
+    ]
+    return sorted(choices, key=lambda choice: (not choice.fits, 0 if choice.fits else choice.size_gb))
+
+
 def known_size(name: str, installed: Sequence[dict]) -> float:
     """Bytes for a model, from what Ollama reports or else the catalog. 0 if unknown."""
     for model in installed:
@@ -146,3 +174,41 @@ def notes_pages_for(context: int) -> int:
 def quiz_pages_for(context: int) -> int:
     """How many lecture pages fit in a quiz prompt beside the generated questions."""
     return max(1, min(12, (context - 2500) // 800))
+
+
+def is_cloud_model(name: str) -> bool:
+    """Ollama's cloud models run on remote servers, so they never qualify: notes stay on this computer."""
+    lowered = name.casefold()
+    return lowered.endswith("-cloud") or lowered.endswith(":cloud")
+
+
+def models_by_role(models: Sequence[dict]) -> dict[str, list[str]]:
+    """Split installed models into what each slot can actually use.
+
+    `models` holds {"name", "capabilities"} entries (capabilities from Ollama's /api/show; may be empty).
+    Chat lists every local model that can generate text, vision only those that can read images,
+    embedding only embedding models. Cloud models are left out entirely.
+    """
+    vision_names = {name for name, _size in VISION_CATALOG}
+    roles: dict[str, list[str]] = {"chat": [], "vision": [], "embedding": []}
+    for model in sorted(models, key=lambda m: m["name"]):
+        name = model["name"]
+        if is_cloud_model(name):
+            continue
+        capabilities = set(model.get("capabilities") or ())
+        if "embedding" in capabilities or (not capabilities and is_embedding_model(name)):
+            roles["embedding"].append(name)
+            continue
+        roles["chat"].append(name)
+        if "vision" in capabilities or name in vision_names or name.removesuffix(":latest") in vision_names:
+            roles["vision"].append(name)
+    return roles
+
+
+def fetch_models_by_role(client, timeout: float = 2.0) -> dict[str, list[str]]:
+    """Ask Ollama what's installed and what each model can do. Raises OllamaError when offline."""
+    models = [{"name": m["name"]} for m in client.list_models(timeout=timeout)]
+    for model in models:
+        if not is_cloud_model(model["name"]):
+            model["capabilities"] = client.capabilities(model["name"])
+    return models_by_role(models)

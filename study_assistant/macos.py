@@ -1,4 +1,4 @@
-"""The few macOS features Qt doesn't expose: a global hotkey, screen capture, floating windows.
+"""The few macOS features Qt doesn't expose: global shortcuts, screen capture, floating windows.
 
 Everything goes through ctypes and system tools, so there's no extra dependency to bundle. On other
 platforms the hotkey and float helpers do nothing and capture raises ScreenCaptureError.
@@ -11,15 +11,14 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
-HOTKEY_LABEL = "⌃⌥Space"
-_KEY_SPACE = 49
-_MODIFIER_OPTION = 0x0800
-_MODIFIER_CONTROL = 0x1000
 _EVENT_CLASS_KEYBOARD = 0x6B657962  # 'keyb'
 _EVENT_HOTKEY_PRESSED = 5
 _HOTKEY_SIGNATURE = 0x43525458  # 'CRTX'
+_PARAM_DIRECT_OBJECT = 0x2D2D2D2D  # '----'
+_TYPE_HOTKEY_ID = 0x686B6964  # 'hkid'
 
 SCREEN_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
 
@@ -36,6 +35,72 @@ def _framework(name: str) -> ctypes.CDLL:
 # Global hotkey
 # ---------------------------------------------------------------------------------------------
 
+# Carbon modifier flags and US-layout virtual key codes (Carbon hotkeys use physical key positions).
+_MODIFIERS = {"cmd": 0x0100, "shift": 0x0200, "option": 0x0800, "control": 0x1000}
+_SYMBOLS = {"control": "⌃", "option": "⌥", "shift": "⇧", "cmd": "⌘"}  # Apple's display order
+KEY_CODES: dict[str, int] = {
+    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11, "q": 12,
+    "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23,
+    "=": 24, "9": 25, "7": 26, "-": 27, "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34,
+    "p": 35, "return": 36, "l": 37, "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44,
+    "n": 45, "m": 46, ".": 47, "tab": 48, "space": 49, "`": 50,
+    "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98, "f8": 100, "f9": 101,
+    "f10": 109, "f11": 103, "f12": 111,
+}
+_KEY_LABELS = {"space": "Space", "return": "↩", "tab": "⇥"}
+
+
+@dataclass(frozen=True)
+class Shortcut:
+    """A global key combination, stored as text like "cmd+shift+space"."""
+
+    key: str
+    modifiers: frozenset[str] = frozenset()
+
+    @classmethod
+    def parse(cls, text: str) -> "Shortcut | None":
+        """Read "cmd+shift+space". Returns None for "" or "off" (shortcut disabled)."""
+        parts = [p.strip().casefold() for p in (text or "").split("+") if p.strip()]
+        if not parts or parts == ["off"]:
+            return None
+        *names, key = parts
+        aliases = {"command": "cmd", "ctrl": "control", "alt": "option", "opt": "option"}
+        modifiers = frozenset(aliases.get(name, name) for name in names)
+        if key not in KEY_CODES or not modifiers <= set(_MODIFIERS):
+            raise ValueError(f"Unsupported shortcut: {text}")
+        return cls(key, modifiers)
+
+    def validate(self) -> None:
+        """Global shortcuts need ⌘, ⌃, or ⌥, or they'd swallow ordinary typing in every app."""
+        if not self.modifiers & {"cmd", "control", "option"} and not self.key.startswith("f"):
+            raise ValueError("Use at least one of ⌘, ⌃ or ⌥ so the shortcut doesn't block normal typing.")
+
+    @property
+    def text(self) -> str:
+        order = [m for m in ("cmd", "control", "option", "shift") if m in self.modifiers]
+        return "+".join([*order, self.key])
+
+    @property
+    def label(self) -> str:
+        symbols = "".join(_SYMBOLS[m] for m in ("control", "option", "shift", "cmd") if m in self.modifiers)
+        return symbols + _KEY_LABELS.get(self.key, self.key.upper())
+
+    @property
+    def carbon(self) -> tuple[int, int]:
+        mask = 0
+        for modifier in self.modifiers:
+            mask |= _MODIFIERS[modifier]
+        return KEY_CODES[self.key], mask
+
+
+def shortcut_label(text: str) -> str:
+    try:
+        shortcut = Shortcut.parse(text)
+    except ValueError:
+        return "OFF"
+    return shortcut.label if shortcut else "OFF"
+
+
 class _EventTypeSpec(ctypes.Structure):
     _fields_ = [("event_class", ctypes.c_uint32), ("event_kind", ctypes.c_uint32)]
 
@@ -47,15 +112,18 @@ class _EventHotKeyID(ctypes.Structure):
 _HANDLER = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
 
 
-class GlobalHotkey:
-    """Calls back on the main thread when ⌃⌥Space is pressed, whichever app is in front.
+class HotkeyManager:
+    """Global shortcuts that fire on the main thread whichever app is in front (macOS).
 
-    Carbon's RegisterEventHotKey is used because, unlike event taps, it needs no Accessibility or
-    Input Monitoring permission.
+    Carbon's RegisterEventHotKey needs no Accessibility or Input Monitoring permission. One event
+    handler serves every shortcut and dispatches on the hotkey ID. Elsewhere this does nothing.
     """
 
-    def __init__(self, on_press: Callable[[], None]) -> None:
-        self.registered = False
+    def __init__(self) -> None:
+        self._callbacks: dict[int, Callable[[], None]] = {}
+        self._refs: list[ctypes.c_void_p] = []
+        self._next_id = 1
+        self._carbon = None
         if sys.platform != "darwin":
             return
         carbon = _framework("Carbon")
@@ -70,31 +138,57 @@ class GlobalHotkey:
         ]
         carbon.UnregisterEventHotKey.argtypes = [ctypes.c_void_p]
         carbon.RemoveEventHandler.argtypes = [ctypes.c_void_p]
-        self._carbon = carbon
+        carbon.GetEventParameter.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+            ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p,
+        ]
 
-        def handle(_call_ref, _event, _user_data) -> int:
-            on_press()
+        def handle(_call_ref, event, _user_data) -> int:
+            hotkey = _EventHotKeyID()
+            if carbon.GetEventParameter(event, _PARAM_DIRECT_OBJECT, _TYPE_HOTKEY_ID, None,
+                                        ctypes.sizeof(hotkey), None, ctypes.byref(hotkey)) == 0:
+                callback = self._callbacks.get(hotkey.id)
+                if callback:
+                    callback()
             return 0
 
         self._callback = _HANDLER(handle)  # Carbon holds this pointer, so it must outlive the handler
-        target = carbon.GetApplicationEventTarget()
-        spec = _EventTypeSpec(_EVENT_CLASS_KEYBOARD, _EVENT_HOTKEY_PRESSED)
         self._handler_ref = ctypes.c_void_p()
-        self._hotkey_ref = ctypes.c_void_p()
-        if carbon.InstallEventHandler(target, self._callback, 1, ctypes.byref(spec), None,
-                                      ctypes.byref(self._handler_ref)):
-            return
-        status = carbon.RegisterEventHotKey(
-            _KEY_SPACE, _MODIFIER_CONTROL | _MODIFIER_OPTION, _EventHotKeyID(_HOTKEY_SIGNATURE, 1),
-            target, 0, ctypes.byref(self._hotkey_ref),
+        spec = _EventTypeSpec(_EVENT_CLASS_KEYBOARD, _EVENT_HOTKEY_PRESSED)
+        if carbon.InstallEventHandler(carbon.GetApplicationEventTarget(), self._callback, 1,
+                                      ctypes.byref(spec), None, ctypes.byref(self._handler_ref)) == 0:
+            self._carbon = carbon
+
+    def register(self, shortcut: Shortcut | None, on_press: Callable[[], None]) -> bool:
+        """True when registered. False if off, unsupported here, or another app already owns it."""
+        if shortcut is None or self._carbon is None:
+            return False
+        key, mask = shortcut.carbon
+        ref = ctypes.c_void_p()
+        hotkey_id = self._next_id
+        self._next_id += 1
+        status = self._carbon.RegisterEventHotKey(
+            key, mask, _EventHotKeyID(_HOTKEY_SIGNATURE, hotkey_id),
+            self._carbon.GetApplicationEventTarget(), 0, ctypes.byref(ref),
         )
-        self.registered = status == 0  # non-zero: another app already owns this shortcut
+        if status != 0:
+            return False
+        self._callbacks[hotkey_id] = on_press
+        self._refs.append(ref)
+        return True
+
+    def clear(self) -> None:
+        if self._carbon is not None:
+            for ref in self._refs:
+                self._carbon.UnregisterEventHotKey(ref)
+        self._refs.clear()
+        self._callbacks.clear()
 
     def close(self) -> None:
-        if self.registered:
-            self._carbon.UnregisterEventHotKey(self._hotkey_ref)
+        self.clear()
+        if self._carbon is not None:
             self._carbon.RemoveEventHandler(self._handler_ref)
-            self.registered = False
+            self._carbon = None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -130,6 +224,26 @@ def capture_region(x: int, y: int, width: int, height: int) -> bytes:
         )
         if done.returncode != 0 or not path.exists():
             raise ScreenCaptureError(done.stderr.strip() or "macOS did not return a screenshot.")
+        return path.read_bytes()
+
+
+def capture_interactive() -> bytes | None:
+    """Let the user drag out a region (or click a window) with macOS's own picker.
+
+    Returns None if they press Esc. Blocks until they finish, so call it off the UI thread.
+    """
+    if sys.platform != "darwin":
+        raise ScreenCaptureError("Screen capture is only available on macOS.")
+    with tempfile.TemporaryDirectory(prefix="cortex-screen-") as folder:
+        path = Path(folder) / "area.png"
+        done = subprocess.run(
+            ["/usr/sbin/screencapture", "-i", "-x", "-t", "png", str(path)],
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+        if not path.exists():
+            if done.returncode not in (0, 1):
+                raise ScreenCaptureError(done.stderr.strip() or "macOS did not return a screenshot.")
+            return None  # cancelled with Esc
         return path.read_bytes()
 
 

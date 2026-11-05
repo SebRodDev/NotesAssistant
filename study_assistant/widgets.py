@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
 )
 
 from .ollama import source_label
-from .theme import COLORS
+from .rich_text import render_markdown
+from .theme import ACCENTS, COLORS, mono_family
 
 
 # ---------------------------------------------------------------------------------------------
@@ -50,9 +51,12 @@ def _inside_bust(x: float, y: float, style: int) -> float:
 class AgentAvatar(QWidget):
     """A dot-matrix bust generated from the agent's name, with an animated link ring."""
 
-    def __init__(self, name: str = "", accent: str = "#9b87f5", size: int = 40, ring: bool = False,
+    clicked = Signal()
+
+    def __init__(self, name: str = "", accent: str = ACCENTS[0], size: int = 40, ring: bool = False,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._offline = False
         self._name = name
         self._accent = QColor(accent)
         self._ring = ring
@@ -77,6 +81,15 @@ class AgentAvatar(QWidget):
         else:
             self._timer.stop()
             self.update()
+
+    def set_offline(self, offline: bool) -> None:
+        self._offline = offline
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
     def _tick(self) -> None:
         self._phase = (self._phase + 0.06) % (2 * math.pi)
@@ -106,7 +119,10 @@ class AgentAvatar(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w = self.width()
         center = QPointF(w / 2, w / 2)
-        scale = w * (0.36 if self._ring else 0.46)
+        compact = self._ring and w < 120  # a small status badge: thinner ring, no tick marks
+        if self._offline:
+            painter.setOpacity(0.35)
+        scale = w * (0.30 if compact else 0.36 if self._ring else 0.46)
         dot = max(1.0, w / 110)
         painter.setPen(Qt.PenStyle.NoPen)
         for x, y, brightness in self._dots:
@@ -115,7 +131,18 @@ class AgentAvatar(QWidget):
             color.setAlphaF(max(0.08, min(1.0, brightness * shimmer)))
             painter.setBrush(color)
             painter.drawEllipse(QPointF(center.x() + x * scale, center.y() + y * scale * 0.98), dot, dot)
-        if self._ring:
+        if compact:
+            radius = w * 0.44
+            faint = QColor(self._accent)
+            faint.setAlphaF(0.25)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(faint, 1))
+            painter.drawEllipse(center, radius, radius)
+            painter.setPen(QPen(self._accent, 2 if self._busy else 1.5))
+            rect = QRectF(center.x() - radius, center.y() - radius, radius * 2, radius * 2)
+            start = int((90 + math.degrees(self._phase) * 3) * 16)
+            painter.drawArc(rect, start, int((-110 if self._busy else -300) * 16))
+        elif self._ring:
             radius = w * 0.46
             faint = QColor(self._accent)
             faint.setAlphaF(0.18)
@@ -221,7 +248,7 @@ class ChatMessageWidget(QFrame):
         parent: QWidget | None = None,
         *,
         agent_name: str = "Assistant",
-        accent: str = "#9b87f5",
+        accent: str = ACCENTS[0],
         retrieval: str = "",
         streaming: bool = False,
     ) -> None:
@@ -290,13 +317,27 @@ class ChatMessageWidget(QFrame):
             self.body.setTextFormat(Qt.TextFormat.PlainText)
             outer.addWidget(bubble)
         else:
-            self.body.setTextFormat(Qt.TextFormat.MarkdownText)
+            self.body.setTextFormat(Qt.TextFormat.RichText)  # Markdown → HTML with rendered math and code
             outer.addWidget(self.body)
         self._render_body()
 
-        self.sources_host = QVBoxLayout()
+        # The first source shows; the rest fold away under one toggle, so a heavily cited answer
+        # doesn't end in a wall of links.
+        self.first_source_host = QVBoxLayout()
+        self.first_source_host.setContentsMargins(0, 0, 0, 0)
+        outer.addLayout(self.first_source_host)
+        self.sources_toggle = QPushButton()
+        self.sources_toggle.setObjectName("sourcesToggle")
+        self.sources_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sources_toggle.setCheckable(True)
+        self.sources_toggle.toggled.connect(self._show_sources)
+        outer.addWidget(self.sources_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        self.sources_panel = QWidget()
+        self.sources_host = QVBoxLayout(self.sources_panel)
+        self.sources_host.setContentsMargins(0, 2, 0, 0)
         self.sources_host.setSpacing(4)
-        outer.addLayout(self.sources_host)
+        self.sources_panel.setVisible(False)
+        outer.addWidget(self.sources_panel)
         self.source_buttons: list[QPushButton] = []
 
         self.actions = QHBoxLayout()
@@ -347,13 +388,24 @@ class ChatMessageWidget(QFrame):
         shown = self.text
         if self.streaming:
             shown = (shown or "") + " ▍"
-        self.body.setText(shown)
+        self._show(shown)
+
+    def _show(self, markdown: str) -> None:
+        if self.role == "user":
+            self.body.setText(markdown)
+        else:
+            self.body.setText(render_markdown(markdown, COLORS, mono_family()))
+
+    def set_waiting(self, text: str) -> None:
+        """While nothing has streamed yet, say what we're waiting on (and for how long)."""
+        if self.streaming and not self.text:
+            self._show(f"*{text}* ▍")
 
     # -- sources -------------------------------------------------------------------------------
     def set_sources(self, sources: list[dict]) -> None:
         self.sources = sources or []
         for button in self.source_buttons:
-            self.sources_host.removeWidget(button)
+            button.setParent(None)
             button.deleteLater()
         self.source_buttons = []
         for index, source in enumerate(self.sources, start=1):
@@ -363,7 +415,18 @@ class ChatMessageWidget(QFrame):
             button.setToolTip("Open this page in the side panel")
             button.clicked.connect(lambda _checked=False, page=source: self.source_opened.emit(page))
             self.source_buttons.append(button)
-            self.sources_host.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
+            host = self.first_source_host if index == 1 else self.sources_host
+            host.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.sources_toggle.setVisible(len(self.sources) > 1)
+        self._show_sources(self.sources_toggle.isChecked())
+
+    def _show_sources(self, expanded: bool) -> None:
+        more = len(self.sources) - 1
+        arrow = "▾" if expanded else "▸"
+        self.sources_toggle.setText(f"{arrow}  {more} MORE SOURCE{'S' if more != 1 else ''}")
+        self.sources_toggle.setToolTip("Hide the other pages this answer cites" if expanded
+                                       else "Show the other pages this answer cites")
+        self.sources_panel.setVisible(expanded and more > 0)
 
     def set_available_width(self, width: int) -> None:
         maximum = max(280, width)
@@ -451,5 +514,5 @@ class MeterBar(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(COLORS["border_hi"]))
         filled = self.rect().adjusted(0, 0, -int(self.width() * (1 - self._value)), 0)
-        painter.fillRect(filled, QColor(COLORS["white"]))
+        painter.fillRect(filled, QColor(COLORS["cyan"]))
         painter.end()

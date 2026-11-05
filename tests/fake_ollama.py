@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CHAT_MODELS = {"qwen3:8b": ["completion", "thinking"], "qwen2.5vl:7b": ["completion", "vision"]}
@@ -27,8 +28,9 @@ def fake_vector(text: str) -> list[float]:
 
 class FakeOllama:
     def __init__(self, answer: str = "Priority inversion happens when a low-priority task holds a lock [S1]. "
-                                      "Priority inheritance fixes it [S1][S9].") -> None:
+                                      "Priority inheritance fixes it [S1][S9].", token_delay: float = 0.0) -> None:
         self.answer = answer
+        self.token_delay = token_delay  # seconds between streamed tokens, to test Stop
         self.requests: list[dict] = []
         handler = self._handler()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -75,6 +77,9 @@ class FakeOllama:
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 fake.requests.append({"path": self.path, **payload})
                 model = payload.get("model", "")
+                if self.path == "/api/pull":
+                    self._pull(model)
+                    return
                 known = {**CHAT_MODELS, **EMBED_MODELS}
                 if model and model not in known and f"{model}:latest" not in known:
                     self._send({"error": f"model '{model}' not found"}, 404)
@@ -87,6 +92,19 @@ class FakeOllama:
                     self._chat(payload)
                 else:
                     self._send({"error": "not found"}, 404)
+
+            def _pull(self, model: str) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.end_headers()
+                if model == "no-such-model":
+                    updates = [{"error": "pull model manifest: file does not exist"}]
+                elif model == "cut-off-model":
+                    updates = [{"status": "pulling", "total": 100, "completed": 50}]
+                else:
+                    updates = [{"status": "pulling", "total": 100, "completed": 50}, {"status": "success"}]
+                for update in updates:
+                    self.wfile.write((json.dumps(update) + "\n").encode())
 
             def _chat(self, payload: dict) -> None:
                 self.send_response(200)
@@ -119,7 +137,12 @@ class FakeOllama:
                 chunks.append({"done": True, "message": {"role": "assistant", "content": ""},
                                "eval_count": 40, "eval_duration": 1_000_000_000, "prompt_eval_count": 800})
                 for chunk in chunks:
-                    self.wfile.write((json.dumps(chunk) + "\n").encode())
-                    self.wfile.flush()
+                    try:
+                        self.wfile.write((json.dumps(chunk) + "\n").encode())
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return  # the client hung up (Stop)
+                    if fake.token_delay:
+                        time.sleep(fake.token_delay)
 
         return Handler
