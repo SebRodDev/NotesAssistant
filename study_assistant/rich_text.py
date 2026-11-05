@@ -224,14 +224,33 @@ def _highlight(code: str, language: str) -> str:
         return html.escape(code)
 
 
-def _code_block_html(code: str, language: str, colors: dict, mono: str) -> str:
+COPY_LINK = "copy:"  # href of a code block's COPY link: copy:<index of the block in the answer>
+
+
+def code_blocks(text: str) -> list[str]:
+    """The fenced code blocks in an answer, in order: what each block's COPY link copies."""
+    return [m.group(4).rstrip("\n") for m in _FENCE.finditer(text)]
+
+
+def _code_block_html(code: str, language: str, colors: dict, mono: str, index: int | None = None,
+                     copied: bool = False) -> str:
     code = code.rstrip("\n")
-    label = (f'<p style="margin: 0 0 6px 0; color: {colors["muted"]}; font-family: \'{mono}\'; font-size: 10px;">'
-             f"{html.escape(language.upper())}</p>") if language else ""
+    small = f"font-family: '{mono}'; font-size: 11px;"
+    copy = ""
+    if index is not None:  # a finished answer: offer to copy the block
+        copy = (f'<span style="{small} color: {colors["cyan"]};">✓ COPIED</span>' if copied else
+                f'<a href="{COPY_LINK}{index}" style="{small} color: {colors["cyan"]}; text-decoration: none;">'
+                "⧉ COPY</a>")
+    label = ""
+    if language or copy:
+        label = (f'<table width="100%" cellspacing="0" cellpadding="0" style="margin-bottom: 6px;"><tr>'
+                 f'<td style="{small} color: {colors["muted"]};">{html.escape(language.upper())}</td>'
+                 f'<td align="right">{copy}</td></tr></table>')
     body = _highlight(code, language).rstrip("\n")
     return (f'<table width="100%" cellspacing="0" cellpadding="10" style="margin-top: 4px; margin-bottom: 18px;" '
             f'bgcolor="{colors["raised"]}"><tr><td style="border: 1px solid {colors["border"]};">{label}'
-            f'<pre style="font-family: \'{mono}\'; font-size: 12px; color: {colors["text"]}; margin: 0;">'
+            f'<pre style="font-family: \'{mono}\'; font-size: 13px; color: {colors["text"]}; margin: 0; '
+            f'white-space: pre-wrap;">'
             f"{body}</pre></td></tr></table>")
 
 
@@ -268,7 +287,24 @@ def _space_out(document: QTextDocument) -> None:
         block = block.next()
 
 
-def render_markdown(text: str, colors: dict, mono: str) -> str:
+def warm_up() -> None:
+    """Import matplotlib's math renderer and Pygments ahead of time (off the UI thread), so the first
+    formula or code block in an answer doesn't stall the window for a second or two."""
+    try:
+        from matplotlib.figure import Figure  # the slow part is importing these
+        from matplotlib.mathtext import MathTextParser
+
+        from pygments.lexers import get_lexer_by_name
+
+        assert Figure is not None
+        MathTextParser("path")
+        get_lexer_by_name("python")
+    except Exception:
+        pass
+
+
+def render_markdown(text: str, colors: dict, mono: str, *, copy_links: bool = False,
+                    copied: int | None = None) -> str:
     """Markdown with LaTeX math and fenced code → Qt rich-text HTML in the theme's colours."""
     pieces: list[str] = []
 
@@ -278,7 +314,14 @@ def render_markdown(text: str, colors: dict, mono: str) -> str:
         return f"\n\n{token}\n\n" if block else token
 
     # Order matters: code first (its contents are literal), then display math, then inline pieces.
-    text = _FENCE.sub(lambda m: stash(_code_block_html(m.group(4), m.group(3), colors, mono), True), text)
+    blocks = iter(range(10_000))
+
+    def code(match: re.Match) -> str:
+        index = next(blocks)
+        return stash(_code_block_html(match.group(4), match.group(3), colors, mono,
+                                      index if copy_links else None, copied == index), True)
+
+    text = _FENCE.sub(code, text)
     text = _INLINE_CODE.sub(lambda m: stash(
         f'<code style="font-family: \'{mono}\'; background-color: {colors["raised"]}; color: {colors["text"]};">'
         f"&nbsp;{html.escape(m.group(2).strip())}&nbsp;</code>"), text)

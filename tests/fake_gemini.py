@@ -34,7 +34,11 @@ class FakeGemini:
         self.silent_models: dict[str, float] = {}  # models that wait this many seconds before answering
         self.reject_thinking: set[str] = set()  # models that 400 on thinkingBudget / thinkingLevel
         self.last_system = ""
-        self.missing_models: set[str] = set()  # listed, but 404 "not found" for this key (retired models)
+        self.missing_models: set[str] = set()
+        # ("max" | "silent" | "stop" | "broken", words): cut the next answer off. "stop" claims it finished;
+        # "broken" ends the stream mid-message.
+        self.truncate: tuple[str, int] | None = None
+        self.busy_on_continue = False  # answer 503 when asked to carry on a cut-off answer
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.api_root = f"http://127.0.0.1:{self.server.server_address[1]}/v1beta"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -108,7 +112,8 @@ class FakeGemini:
                     return
                 if model in fake.silent_models:
                     time.sleep(fake.silent_models[model])
-                if model in fake.busy_models:
+                wants_more = "cut off" in json.dumps((payload.get("contents") or [{}])[-1])
+                if model in fake.busy_models or (fake.busy_on_continue and wants_more):
                     self._send({"error": {"code": 503, "status": "UNAVAILABLE",
                                           "message": "This model is currently experiencing high demand."}}, 503)
                     return
@@ -145,6 +150,16 @@ class FakeGemini:
                     chunks.append({"candidates": [{"content": {"parts": [{"text": text}], "role": "model"}}]})
                 else:
                     words = fake.answer.split(" ")
+                    finish = "STOP"
+                    last_turn = (payload.get("contents") or [{}])[-1]
+                    asked_to_continue = "cut off" in json.dumps(last_turn)
+                    if fake.truncate and not asked_to_continue:
+                        how, keep = fake.truncate
+                        words, finish = words[:keep], {"max": "MAX_TOKENS", "stop": "STOP"}.get(how, "")
+                        fake.cut_at = keep
+                    elif asked_to_continue:
+                        fake.truncate = None
+                        words = words[fake.cut_at - 3:]  # repeats a few words, as models sometimes do
                     chunks += [{"candidates": [{"content": {"parts": [{"text": w + " "}], "role": "model"}}]}
                                for w in words]
                 # Like Gemini's implicit cache: a request that starts like the previous one reuses that part.
@@ -154,7 +169,11 @@ class FakeGemini:
                 chunks[-1]["usageMetadata"] = {"promptTokenCount": 900, "candidatesTokenCount": 30,
                                                **({"cachedContentTokenCount": cached} if cached else {})}
                 chunks[-1]["candidates"] = chunks[-1].get("candidates", [{}])
-                chunks[-1]["candidates"][0]["finishReason"] = "STOP"
+                if config.get("responseMimeType") == "application/json":
+                    finish = "STOP"
+                if finish:
+                    chunks[-1]["candidates"][0]["finishReason"] = finish
+                broken = finish == "" and fake.truncate and fake.truncate[0] == "broken"
                 for chunk in chunks:
                     try:
                         self.wfile.write(f"data: {json.dumps(chunk)}\r\n\r\n".encode())
@@ -163,5 +182,9 @@ class FakeGemini:
                         return
                     if fake.token_delay:
                         time.sleep(fake.token_delay)
+                if broken:  # the connection dies halfway through a message
+                    self.wfile.write(b'data: {"candidates": [{"content": {"par')
+                    self.wfile.flush()
+                    self.close_connection = True
 
         return Handler

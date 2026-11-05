@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QTabBar,
     QTabWidget,
     QTextBrowser,
     QTreeWidget,
@@ -84,9 +86,29 @@ from .providers import (
     save_settings,
 )
 from .pdf_reader import extract_page_texts, render_page
+from .rich_text import warm_up as rich_text_warm_up
 from .storage import Library
-from .theme import ACCENTS, APP_NAME, APP_TAGLINE, COLORS, creativity_label, mono_font, stylesheet
-from .widgets import AgentAvatar, AgentCard, ChatMessageWidget, ComposerInput, MeterBar
+from .theme import (
+    ACCENTS,
+    APP_NAME,
+    APP_TAGLINE,
+    COLORS,
+    creativity_label,
+    mono_family,
+    mono_font,
+    sans_family,
+    stylesheet,
+)
+from .widgets import (
+    NAV_DETAIL,
+    NAV_KIND,
+    AgentAvatar,
+    AgentCard,
+    ChatMessageWidget,
+    ComposerInput,
+    MeterBar,
+    NavigatorDelegate,
+)
 
 CONTEXT_WINDOW = 16384
 RETRIEVED_PAGES = 6
@@ -200,6 +222,20 @@ def _mono_label(text: str, name: str = "monoMuted") -> QLabel:
     return label
 
 
+class _EvenTabBar(QTabBar):
+    """Tabs that split the full width evenly, so their labels sit centred under the sidebar."""
+
+    def tabSizeHint(self, index: int):  # noqa: N802
+        hint = super().tabSizeHint(index)
+        parent = self.parentWidget()
+        if parent is not None and self.count():
+            hint.setWidth(parent.width() // self.count())
+        return hint
+
+    def minimumTabSizeHint(self, index: int):  # noqa: N802
+        return super().tabSizeHint(index)
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -221,6 +257,8 @@ class MainWindow(QMainWindow):
         self.current_scope: tuple[str | None, str | None] = (None, None)
         self.message_widgets: list[ChatMessageWidget] = []
         self._conversation_cache: dict[tuple, list[dict]] = {}
+        # Launching opens on the welcome screen (with a way back into the last chat), not straight into it.
+        self._fresh_start = True
         self._streaming_message: ChatMessageWidget | None = None
         self._pending_tokens: list[str] = []
         self.ollama_online: bool | None = None
@@ -234,19 +272,24 @@ class MainWindow(QMainWindow):
 
         load_health(self.settings)  # which Gemini models answered the last model check
         QTimer.singleShot(1500, self._warn_missing_renderers)
+        threading.Thread(target=rich_text_warm_up, name="warm-up", daemon=True).start()
         agents = self.library.agents()
         saved_agent = self.settings.value("agents/current", 0, type=int)
         self.current_agent = next((a for a in agents if a["id"] == saved_agent), agents[0])
 
         self._build_sidebar()
+        self._build_rail()
         self._build_center()
         self._build_right_panel()
         self.overlay = ScreenOverlay(settings=self.settings)
-        self.overlay.read_requested.connect(self.read_screen)
+        self.overlay.capture_requested.connect(self.take_screenshot)
+        self.overlay.ask_requested.connect(self._answer_screen)
         self.overlay.stop_requested.connect(self.stop_screen_answer)
         self.overlay.settings_requested.connect(self.configure_shortcuts)
         self.overlay.source_opened.connect(self._open_source_from_overlay)
         self.screen_task: BackgroundTask | None = None
+        self._capturing = False
+        self._overlay_scroll_pending = False
         self.hotkeys: HotkeyManager | None = None
         self.failed_shortcuts: list[str] = []
 
@@ -255,6 +298,7 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
         root_layout.addWidget(self.sidebar_scroll)
+        root_layout.addWidget(self.rail)
         root_layout.addWidget(self.center_panel, 1)
         root_layout.addWidget(self.right_panel)
         self.setCentralWidget(root)
@@ -286,6 +330,7 @@ class MainWindow(QMainWindow):
         self.refresh_navigation((saved_class or None, saved_lecture or None))
         if not self.message_widgets:
             self._begin_conversation()
+        self._fresh_start = False  # from here on, picking a lecture or course opens its conversation
         self.set_mode("ask")
         self._set_online_status(None)
         if start_monitor:
@@ -293,6 +338,8 @@ class MainWindow(QMainWindow):
             self.hotkeys = HotkeyManager()
         self.apply_shortcuts()
         QShortcut(QKeySequence("Ctrl+K"), self, activated=lambda: self.query.setFocus())
+        QShortcut(QKeySequence("Ctrl+\\"), self, activated=self.toggle_sidebar)  # ⌘\ on a Mac
+        self.set_sidebar_visible(not self.settings.value("ui/sidebar_hidden", False, type=bool))
 
     # -- settings ------------------------------------------------------------------------------
     def model_settings(self) -> dict:
@@ -338,6 +385,12 @@ class MainWindow(QMainWindow):
         self.gear_button.setToolTip("Model settings")
         self.gear_button.clicked.connect(self.configure_models)
         top.addWidget(self.gear_button)
+        self.collapse_button = QPushButton("«")
+        self.collapse_button.setObjectName("railButton")
+        self.collapse_button.setToolTip("Collapse the sidebar to icons (⌘\\)")
+        self.collapse_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.collapse_button.clicked.connect(lambda: self.set_sidebar_visible(False))
+        top.addWidget(self.collapse_button)
         layout.addLayout(top)
         brand = QLabel(APP_NAME.upper())
         brand.setObjectName("brandTitle")
@@ -367,8 +420,14 @@ class MainWindow(QMainWindow):
         self.navigator.setObjectName("courseNavigator")
         self.navigator.setHeaderHidden(True)
         self.navigator.setMinimumHeight(170)
-        self.navigator.setIndentation(14)
+        # Rows are drawn by NavigatorDelegate (selection, chevrons, indentation, counts).
+        self.navigator.setIndentation(0)
+        self.navigator.setRootIsDecorated(False)
+        self.navigator.setMouseTracking(True)
+        self.navigator.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.navigator.setItemDelegate(NavigatorDelegate(sans_family(), mono_family(), self.navigator))
         self.navigator.currentItemChanged.connect(self.change_scope)
+        self.navigator.itemClicked.connect(self._reopen_from_welcome)
         self.import_button = QPushButton("+ ADD LECTURE PDFS")
         self.import_button.setShortcut(QKeySequence.StandardKey.Open)
         self.import_button.setToolTip("Add lecture PDFs (Command+O)")
@@ -413,11 +472,11 @@ class MainWindow(QMainWindow):
         study_layout.addStretch(1)
 
         self.side_tabs = QTabWidget()
+        self.side_tabs.setTabBar(_EvenTabBar())
         self.side_tabs.addTab(courses, "COURSES")
         self.side_tabs.addTab(study, "STUDY")
         self.side_tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)  # never "CO…"
-        self.side_tabs.tabBar().setExpanding(True)
-        self.side_tabs.setDocumentMode(True)
+        self.side_tabs.tabBar().setDrawBase(False)
         layout.addWidget(self.side_tabs, 1)
 
         self.models_button = QPushButton("⬡  MODELS")
@@ -432,10 +491,84 @@ class MainWindow(QMainWindow):
         self.sidebar_scroll.setWidgetResizable(True)
         self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.sidebar_scroll.setFixedWidth(272)
+        self.sidebar_scroll.setFixedWidth(300)
         self.sidebar_scroll.setWidget(sidebar)
         sidebar.setMinimumHeight(720)
-        sidebar.setMaximumWidth(272)
+        sidebar.setMaximumWidth(300)
+
+    def _build_rail(self) -> None:
+        """The collapsed sidebar: a slim bar of icons. » expands it again."""
+        self.rail = QFrame()
+        self.rail.setObjectName("rail")
+        self.rail.setFixedWidth(58)
+        layout = QVBoxLayout(self.rail)
+        layout.setContentsMargins(0, 14, 0, 12)
+        layout.setSpacing(6)
+
+        def icon(text: str, tip: str, action) -> QPushButton:
+            button = QPushButton(text)
+            button.setObjectName("railButton")
+            button.setToolTip(tip)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setFixedSize(40, 36)
+            button.clicked.connect(action)
+            layout.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
+            return button
+
+        self.sidebar_button = icon("»", "Expand the sidebar (⌘\\)", lambda: self.set_sidebar_visible(True))
+        layout.addSpacing(10)
+        self.rail_agents = QVBoxLayout()
+        self.rail_agents.setSpacing(6)
+        layout.addLayout(self.rail_agents)
+        self.rail_agent_buttons: list[QFrame] = []
+        icon("+", "New agent", self.create_agent)
+        rule = QFrame()
+        rule.setObjectName("railRule")
+        rule.setFixedSize(26, 1)
+        layout.addSpacing(6)
+        layout.addWidget(rule, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addSpacing(6)
+        icon("▤", "Courses and lectures", lambda: self._expand_to_tab(0))
+        icon("✎", "Study: quizzes and weak spots", lambda: self._expand_to_tab(1))
+        icon("⇪", "Add lecture PDFs", self.import_pdf)
+        layout.addStretch(1)
+        icon("⬡", "Models", self.configure_models)
+        self.rail_status = QLabel("◇")
+        self.rail_status.setObjectName("railStatus")
+        self.rail_status.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(self.rail_status)
+        self.rail.hide()
+
+    def _expand_to_tab(self, index: int) -> None:
+        self.set_sidebar_visible(True)
+        self.side_tabs.setCurrentIndex(index)
+
+    def _refresh_rail_agents(self) -> None:
+        for holder in self.rail_agent_buttons:
+            self.rail_agents.removeWidget(holder)
+            holder.deleteLater()
+        self.rail_agent_buttons = []
+        for agent in self.library.agents():
+            holder = QFrame()
+            holder.setObjectName("railAgent")
+            holder.setProperty("active", agent["id"] == self.current_agent["id"])
+            holder.setFixedSize(46, 42)
+            inner = QHBoxLayout(holder)
+            inner.setContentsMargins(0, 0, 0, 0)
+            avatar = AgentAvatar(agent["name"], agent["accent"], 34)
+            avatar.setCursor(Qt.CursorShape.PointingHandCursor)
+            avatar.setToolTip(f"{agent['name']} · {self.agent_model(agent)}")
+            avatar.clicked.connect(lambda a=agent["id"]: self.select_agent(a))
+            inner.addWidget(avatar, 0, Qt.AlignmentFlag.AlignCenter)
+            holder.agent_id = agent["id"]
+            self.rail_agents.addWidget(holder, 0, Qt.AlignmentFlag.AlignHCenter)
+            self.rail_agent_buttons.append(holder)
+
+    def _mark_rail_agent(self) -> None:
+        for holder in self.rail_agent_buttons:
+            holder.setProperty("active", holder.agent_id == self.current_agent["id"])
+            holder.style().unpolish(holder)
+            holder.style().polish(holder)
 
     # -- layout: center -----------------------------------------------------------------------
     def _stat(self, row: QHBoxLayout, label: str) -> QLabel:
@@ -527,6 +660,11 @@ class MainWindow(QMainWindow):
         self.chat_scroll.setObjectName("chatScroll")
         self.chat_scroll.setWidgetResizable(True)
         self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Follow the newest message while the chat lays out or streams, until the user scrolls up.
+        self._follow_bottom = True
+        bar = self.chat_scroll.verticalScrollBar()
+        bar.rangeChanged.connect(lambda _low, high: bar.setValue(high) if self._follow_bottom else None)
+        bar.actionTriggered.connect(lambda _action: QTimer.singleShot(0, self._update_follow))
         self.chat_body = QWidget()
         self.chat_body.setObjectName("chatBody")
         self.chat_layout = QVBoxLayout(self.chat_body)
@@ -573,7 +711,125 @@ class MainWindow(QMainWindow):
         self.composer_wrap = QVBoxLayout()
         self.composer_wrap.setContentsMargins(32, 8, 32, 18)
         self.composer_wrap.addWidget(self.composer)
+        self._build_welcome(center)
+
+    SUGGESTIONS = [
+        ("Summarize", "the key ideas, section by section",
+         "Summarize the key ideas of {scope}, section by section."),
+        ("Quiz me", "five questions, one at a time",
+         "Quiz me on {scope}: ask 5 questions one at a time, and wait for my answer before the next."),
+        ("Explain the hardest part", "simply, with an example",
+         "What's the hardest concept in {scope}? Explain it simply, with a worked example."),
+        ("Make a cheat sheet", "definitions, formulas, key facts",
+         "Make a concise cheat sheet for {scope}: key definitions, formulas, and facts to remember."),
+    ]
+
+    def _build_welcome(self, center: QVBoxLayout) -> None:
+        """The empty-chat screen: a greeting, the message box in the middle, and a few one-click starts.
+        It replaces the chat (and moves the composer up) until the first message."""
+        self.welcome = QWidget()
+        self.welcome.setObjectName("welcome")
+        top = QVBoxLayout(self.welcome)
+        top.setContentsMargins(32, 0, 32, 10)
+        top.setSpacing(8)
+        top.addStretch(1)
+        self.welcome_avatar = AgentAvatar("", ACCENTS[0], 120, ring=True)
+        top.addWidget(self.welcome_avatar, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.welcome_title = QLabel()
+        self.welcome_title.setObjectName("welcomeTitle")
+        self.welcome_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        top.addWidget(self.welcome_title)
+        self.welcome_subtitle = QLabel()
+        self.welcome_subtitle.setObjectName("welcomeSubtitle")
+        self.welcome_subtitle.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.welcome_subtitle.setWordWrap(True)
+        top.addWidget(self.welcome_subtitle)
+        top.addSpacing(10)
+        center.addWidget(self.welcome, 1)
         center.addLayout(self.composer_wrap)
+
+        self.welcome_below = QWidget()
+        below = QVBoxLayout(self.welcome_below)
+        below.setContentsMargins(32, 0, 32, 0)
+        below.setSpacing(10)
+        chips = QGridLayout()
+        chips.setSpacing(8)
+        self.suggestion_buttons: list[QPushButton] = []
+        for index, (title, detail, _prompt) in enumerate(self.SUGGESTIONS):
+            button = QPushButton(f"{title}\n{detail}")
+            button.setObjectName("suggestion")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _c=False, i=index: self.use_suggestion(i))
+            chips.addWidget(button, index // 2, index % 2)
+            self.suggestion_buttons.append(button)
+        self.suggestion_grid = QWidget()
+        self.suggestion_grid.setLayout(chips)
+        below.addWidget(self.suggestion_grid, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.resume_button = QPushButton()
+        self.resume_button.setObjectName("ghostButton")
+        self.resume_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.resume_button.clicked.connect(self.resume_conversation)
+        self.resume_button.hide()
+        below.addWidget(self.resume_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        below.addStretch(1)
+        center.addWidget(self.welcome_below, 1)
+        self.welcome.hide()
+        self.welcome_below.hide()
+
+    def _scope_phrase(self) -> str:
+        class_name, lecture_name = self.current_scope
+        if lecture_name:
+            return f"{class_name} · {lecture_name}"
+        return class_name or "my notes"
+
+    def _show_welcome(self, resumable: int = 0) -> None:
+        """Swap the chat for the welcome screen (an empty conversation)."""
+        hour = QTime.currentTime().hour()
+        greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
+        self.welcome_title.setText(f"{greeting}. What would you like to study?")
+        agent = self.current_agent
+        reads = ("answer only from what's there, with citations" if agent["notes_mode"] == "strict" else
+                 "answer with citations, adding general knowledge where your notes stop")
+        class_name, lecture_name = self.current_scope
+        scope = (f"{class_name} · {lecture_name}" if lecture_name else
+                 f"every lecture in {class_name}" if class_name else "all your notes")
+        self.welcome_subtitle.setText(f"{agent['name']} will read {scope} and {reads}.")
+        self.welcome_avatar.set_agent(agent["name"], agent["accent"])
+        self.resume_button.setText(f"↩  RESUME YOUR LAST CHAT HERE · {resumable} MESSAGES")
+        self.resume_button.setVisible(resumable > 0)
+        self._set_welcome(True)
+
+    def _set_welcome(self, on: bool) -> None:
+        self.chat_scroll.setVisible(not on)
+        self.welcome.setVisible(on)
+        self.welcome_below.setVisible(on)
+        self.welcome_avatar.set_busy(on)  # its ring turns slowly while it waits for you
+
+    def use_suggestion(self, index: int) -> None:
+        prompt = self.SUGGESTIONS[index][2].format(scope=self._scope_phrase())
+        self.set_mode("ask")
+        self.query.setText(prompt)
+        self.send_message()
+
+    def _reopen_from_welcome(self, item: QTreeWidgetItem, _column: int = 0) -> None:
+        """Clicking the row that's already selected, while the welcome screen shows, opens its chat."""
+        if not self.message_widgets and item.data(0, Qt.ItemDataRole.UserRole) == self.current_scope:
+            self.resume_conversation()  # (with nothing saved, the welcome screen simply stays)
+
+    def resume_conversation(self) -> None:
+        """Reopen this selection's saved chat from the welcome screen."""
+        self._clear_chat()
+        self._begin_conversation()
+
+    def toggle_sidebar(self) -> None:
+        self.set_sidebar_visible(self.sidebar_scroll.isHidden())
+
+    def set_sidebar_visible(self, visible: bool) -> None:
+        """Full sidebar, or the slim icon rail in its place."""
+        self.sidebar_scroll.setVisible(visible)
+        self.rail.setVisible(not visible)
+        self.settings.setValue("ui/sidebar_hidden", not visible)
+        QTimer.singleShot(0, self._refresh_message_layout)
 
     # -- layout: right panel -------------------------------------------------------------------
     def _build_link_card(self) -> None:
@@ -686,6 +942,7 @@ class MainWindow(QMainWindow):
         self._update_runtime_stat()
         for card in self.agent_cards:
             card.set_active(card.agent_id == agent["id"])
+        self._mark_rail_agent()
         if hasattr(self, "find_mode_button"):
             self.set_mode(self.current_mode())
 
@@ -760,6 +1017,9 @@ class MainWindow(QMainWindow):
     def _set_online_status(self, online: bool | None) -> None:
         self.ollama_online = online
         provider = self.provider
+        self.rail_status.setText("◇" if not online else "◆")
+        self.rail_status.setStyleSheet(f"color: {COLORS['muted'] if online is None else COLORS['ok'] if online else COLORS['bad']};")
+        self.rail_status.setToolTip({None: "Connecting…", True: "Online"}.get(online, "Offline"))
         name = "GEMINI" if provider == GEMINI else "OLLAMA"
         self.footer_label.setText("◆ CLOUD · GEMINI API" if provider == GEMINI else "◆ 100% LOCAL · NO CLOUD")
         if online is None:
@@ -856,6 +1116,7 @@ class MainWindow(QMainWindow):
             card.set_active(agent["id"] == self.current_agent["id"])
             self.agent_list.addWidget(card)
             self.agent_cards.append(card)
+        self._refresh_rail_agents()
 
     def _conversation_key(self) -> tuple:
         return (self.current_agent["id"], self.current_scope)
@@ -958,13 +1219,20 @@ class MainWindow(QMainWindow):
         message.regenerate_requested.connect(lambda m=message: self.regenerate(m))
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, message)
         self.message_widgets.append(message)
+        self._set_welcome(False)
         QTimer.singleShot(0, self._refresh_message_layout)
         QTimer.singleShot(0, self._scroll_to_bottom)
         return message
 
     def _scroll_to_bottom(self) -> None:
+        self._follow_bottom = True
         bar = self.chat_scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
+
+    def _update_follow(self) -> None:
+        """After the user scrolls: keep following only if they're (back) at the bottom."""
+        bar = self.chat_scroll.verticalScrollBar()
+        self._follow_bottom = bar.value() >= bar.maximum() - 40
 
     def _clear_chat(self) -> None:
         for message in self.message_widgets:
@@ -972,6 +1240,7 @@ class MainWindow(QMainWindow):
             message.hide()
             message.deleteLater()
         self.message_widgets.clear()
+        self._set_welcome(True)
 
     def _intro_text(self) -> str:
         agent = self.current_agent
@@ -990,17 +1259,20 @@ class MainWindow(QMainWindow):
 
     def _begin_conversation(self) -> None:
         cached = self._conversation_cache.get(self._conversation_key())
-        if cached is not None:
+        if cached:
             for entry in cached:
                 self._append_message(entry["role"], entry["text"], entry["sources"], kind=entry["kind"])
             return
+        # Each selection keeps its own conversation: a course's chat doesn't pull in its lectures' chats.
         class_name, lecture_name = self.current_scope
-        if class_name is not None and lecture_name is None:
-            for entry in self.library.class_chat_history(class_name, limit=25, agent_id=self.current_agent["id"]):
-                self._append_message("user", entry["question"])
-                self._append_message("assistant", entry["answer"], entry["sources"])
-        if not self.message_widgets:
-            self._append_message("assistant", self._intro_text(), kind="intro")
+        history = self.library.class_chat_history(class_name or "", limit=25, agent_id=self.current_agent["id"],
+                                                  lecture_name=lecture_name or "")
+        if self._fresh_start or not history:
+            self._show_welcome(resumable=2 * len(history) if self._fresh_start else 0)
+            return
+        for entry in history:
+            self._append_message("user", entry["question"])
+            self._append_message("assistant", entry["answer"], entry["sources"])
 
     def _history_for_model(self) -> list[tuple[str, str]]:
         return [(m.role, m.text) for m in self.message_widgets if getattr(m, "kind", "chat") == "chat" and m.text]
@@ -1014,7 +1286,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_message_layout(self) -> None:
         # Centre the conversation by padding both sides equally (aligned items would lose word-wrap heights).
-        viewport = self.chat_scroll.viewport().width()
+        # (The chat area is hidden on the welcome screen, so size from the panel, less a scrollbar.)
+        viewport = self.center_panel.width() - 10
         column = min(self.CHAT_COLUMN, max(280, viewport - 96))
         side = max(48, (viewport - column) // 2)
         self.chat_layout.setContentsMargins(side, 26, side, 26)
@@ -1024,6 +1297,7 @@ class MainWindow(QMainWindow):
         # The message box lines up with the messages above it.
         composer_side = max(32, (self.center_panel.width() - column) // 2)
         self.composer_wrap.setContentsMargins(composer_side, 8, composer_side, 18)
+        self.suggestion_grid.setFixedWidth(min(column, 760))
         self.chat_layout.invalidate()
 
     def set_mode(self, mode: str) -> None:
@@ -1068,9 +1342,7 @@ class MainWindow(QMainWindow):
             select_scope = getattr(self, "current_scope", (None, None))
         self.navigator.blockSignals(True)
         self.navigator.clear()
-        all_item = QTreeWidgetItem(["◇ All materials"])
-        all_item.setData(0, Qt.ItemDataRole.UserRole, (None, None))
-        self.navigator.addTopLevelItem(all_item)
+        # No "All materials" row: every conversation belongs to a course or a lecture.
         classes: dict[str, QTreeWidgetItem] = {}
         for document in _group_lectures(self.library.documents()):
             class_name, lecture_name = document["class_name"], document["lecture_name"]
@@ -1078,14 +1350,21 @@ class MainWindow(QMainWindow):
             if parent is None:
                 parent = QTreeWidgetItem([class_name])
                 parent.setData(0, Qt.ItemDataRole.UserRole, (class_name, None))
+                parent.setData(0, NAV_KIND, "course")
                 self.navigator.addTopLevelItem(parent)
                 classes[class_name] = parent
-            page_word = "page" if document["page_count"] == 1 else "pages"
-            child = QTreeWidgetItem([f"{lecture_name} · {document['page_count']} {page_word}"])
+            pages = document["page_count"]
+            child = QTreeWidgetItem([lecture_name])
             child.setData(0, Qt.ItemDataRole.UserRole, (class_name, lecture_name))
+            child.setData(0, NAV_KIND, "lecture")
+            child.setData(0, NAV_DETAIL, f"{pages} {'page' if pages == 1 else 'pages'}")
+            child.setToolTip(0, f"{lecture_name} · {pages} {'page' if pages == 1 else 'pages'}")
             parent.addChild(child)
+        for parent in classes.values():
+            count = parent.childCount()
+            parent.setData(0, NAV_DETAIL, f"{count} {'lecture' if count == 1 else 'lectures'}")
         self.navigator.expandAll()
-        selected_item = all_item
+        selected_item = self.navigator.topLevelItem(0)  # first course, unless something else was open
         target_class, target_lecture = select_scope
         if target_class is not None and target_class in classes:
             class_item = classes[target_class]
@@ -1096,8 +1375,16 @@ class MainWindow(QMainWindow):
                     selected_item = child
                     break
         self.navigator.blockSignals(False)
-        self.navigator.setCurrentItem(selected_item)
-        self.change_scope(selected_item, None)
+        if selected_item is None:  # an empty library: nothing to select, answers use no notes
+            if self.current_scope != (None, None):
+                self._cache_conversation()
+                self._clear_chat()
+                self.current_scope = (None, None)
+                self._begin_conversation()
+            self.scope_title.setText("NO COURSES YET")
+        else:
+            self.navigator.setCurrentItem(selected_item)
+            self.change_scope(selected_item, None)
         self.update_library_status()
 
     def _warn_missing_renderers(self) -> None:
@@ -1186,14 +1473,18 @@ class MainWindow(QMainWindow):
 
     def clear_conversation(self) -> None:
         class_name, lecture_name = self.current_scope
-        if class_name and not lecture_name:
+        saved = self.library.class_chat_history(class_name or "", limit=1, agent_id=self.current_agent["id"],
+                                                lecture_name=lecture_name or "")
+        if saved:
+            where = lecture_name or class_name or "all materials"
             answer = QMessageBox.question(
                 self, "Clear conversation",
-                f"Clear {self.current_agent['name']}'s saved conversation for {class_name}?",
+                f"Clear {self.current_agent['name']}'s saved conversation for {where}? "
+                "Conversations for other lectures and courses are kept.",
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            self.library.clear_class_chat(class_name, self.current_agent["id"])
+            self.library.clear_class_chat(class_name or "", self.current_agent["id"], lecture_name=lecture_name or "")
         self._conversation_cache.pop(self._conversation_key(), None)
         self._clear_chat()
         self._begin_conversation()
@@ -1667,10 +1958,11 @@ class MainWindow(QMainWindow):
                 return {**partial, "answer": (partial["answer"] + "\n\n*Stopped.*").strip()}
             if not result.get("answerable", True):  # read pages, but they don't cover it: say what was read
                 result["answer"] = self._explain_no_pages(class_name, lecture_name, models, len(sources))
-            if class_name and fixed_sources is None:
+            if fixed_sources is None:  # saved under exactly this selection: lecture, course, or everything
                 library = Library(database)
                 try:
-                    library.save_class_chat(class_name, question, result["answer"], result["sources"], agent["id"])
+                    library.save_class_chat(class_name or "", question, result["answer"], result["sources"],
+                                            agent["id"], lecture_name=lecture_name or "")
                 finally:
                     library.close()
             return result
@@ -1896,8 +2188,8 @@ class MainWindow(QMainWindow):
             self.overlay.set_model(model)
 
     def read_screen_now(self) -> None:
-        """The global "read screen" shortcut: answer in the overlay's current mode, whether or not it's open."""
-        self.read_screen("", self.overlay.mode(), False)
+        """The global screenshot shortcut: attach a screenshot to the overlay (it isn't sent until SEND)."""
+        self.take_screenshot(False)
 
     def _open_source_from_overlay(self, row: dict) -> None:
         self.showNormal()
@@ -1906,50 +2198,69 @@ class MainWindow(QMainWindow):
         self.open_source_page(row)
 
     def read_screen(self, question: str = "", mode: str = "solve", pick_area: bool = False) -> None:
-        """Capture the screen (or an area the user drags out) without the overlay in it, then answer."""
-        if self.screen_task is not None:
+        """Take a screenshot and ask about it straight away (the overlay's SEND does this in two steps)."""
+        self.take_screenshot(pick_area, then=lambda png: self._answer_screen(question, mode, png))
+
+    def take_screenshot(self, pick_area: bool = False, then: Callable[[bytes], None] | None = None) -> None:
+        """One still screenshot (never a recording), only when asked. By default it's attached to the
+        overlay to send with a question; `then` receives it instead."""
+        if self.screen_task is not None or self._capturing:
             return
         if not screen_capture_allowed():
             request_screen_capture()
             self.overlay.show_overlay()
             message = self.overlay.add_message(
                 "assistant",
-                "Cortex needs **Screen Recording** permission to read your screen. Turn it on in System "
-                "Settings → Privacy & Security → Screen Recording (for Cortex, or for Terminal if you start it "
-                "with `cortex`), then quit and reopen the app.",
+                "Cortex needs **Screen Recording** permission to take a screenshot (that's what macOS calls "
+                "it; Cortex only takes a single still image when you ask). Turn it on in System Settings → "
+                "Privacy & Security → Screen Recording (for Cortex, or for Terminal if you start it with "
+                "`cortex`), then quit and reopen the app.",
             )
             message.kind = "error"
             QDesktopServices.openUrl(QUrl(SCREEN_SETTINGS_URL))
             return
-        self.settings.setValue("overlay/mode", mode)
+        deliver = then or self.overlay.attach_screenshot
         was_visible = self.overlay.isVisible()
         center = self.overlay.geometry().center() if was_visible else self.cursor().pos()
         screen = QGuiApplication.screenAt(center) or QGuiApplication.primaryScreen()
         area = screen.geometry()
-        self.overlay.set_busy(True, "PICK AN AREA…" if pick_area else "CAPTURING…")
-        self.overlay.hide()  # keep the panel itself out of the screenshot
+        self._capturing = True
+        self.overlay.set_busy(True, "PICK AN AREA…" if pick_area else "TAKING SCREENSHOT…")
+        # Fade the panel out of the shot instead of hiding it: hiding the app's last floating window
+        # makes macOS bring the main window to the front.
+        self.overlay.setWindowOpacity(0.0)
+
+        def done(png: bytes | None, error: str | None = None) -> None:
+            self._capturing = False
+            self.overlay.setWindowOpacity(1.0)
+            self.overlay.show_overlay()
+            self.overlay.set_busy(False)
+            if error is not None:
+                self.overlay.add_message("assistant", f"⚠ I couldn't take the screenshot: {error}").kind = "error"
+            elif png is not None:  # None: Esc in the area picker
+                deliver(self._shrink_png(png))
+
         if pick_area:
-            self._pick_area_then_answer(question, mode)
+            picker = BackgroundTask(lambda _progress: capture_interactive())
+            self.screen_task = picker
+
+            def picked() -> None:
+                self.screen_task = None
+                picker.deleteLater()
+                done(picker.result, picker.error)
+
+            picker.finished.connect(picked)
+            picker.start()
         else:
-            QTimer.singleShot(250, lambda: self._capture_and_answer(question, mode, area))
+            def grab() -> None:
+                try:
+                    png = capture_region(area.x(), area.y(), area.width(), area.height())
+                except ScreenCaptureError as error:
+                    done(None, str(error))
+                    return
+                done(png)
 
-    def _pick_area_then_answer(self, question: str, mode: str) -> None:
-        picker = BackgroundTask(lambda _progress: capture_interactive())
-        self.screen_task = picker
-
-        def picked() -> None:
-            self.screen_task = None
-            picker.deleteLater()
-            if picker.error is not None:
-                self._screen_failed(picker.error)
-            elif picker.result is None:  # Esc in the picker
-                self.overlay.show_overlay()
-                self.overlay.set_busy(False)
-            else:
-                self._answer_screen(question, mode, self._shrink_png(picker.result))
-
-        picker.finished.connect(picked)
-        picker.start()
+            QTimer.singleShot(150, grab)  # let the fade reach the screen first
 
     @staticmethod
     def _shrink_png(png: bytes, max_side: int = 1600) -> bytes:
@@ -1964,34 +2275,39 @@ class MainWindow(QMainWindow):
         image.save(buffer, "PNG")
         return bytes(buffer.data())
 
-    def _screen_failed(self, error: str) -> None:
-        self.overlay.show_overlay()
-        self.overlay.set_busy(False)
-        self.overlay.add_message("assistant", f"⚠ I couldn't capture the screen: {error}").kind = "error"
-
-    def _capture_and_answer(self, question: str, mode: str, area) -> None:
-        try:
-            image = self._shrink_png(capture_region(area.x(), area.y(), area.width(), area.height()))
-        except ScreenCaptureError as error:
-            self._screen_failed(str(error))
+    def _answer_screen(self, question: str, mode: str, image: bytes | None) -> None:
+        """Answer in the overlay, about the attached screenshot if there is one (else as a plain question)."""
+        if self.screen_task is not None:
             return
-        self._answer_screen(question, mode, image)
-
-    def _answer_screen(self, question: str, mode: str, image: bytes) -> None:
         self.overlay.show_overlay()
+        self.settings.setValue("overlay/mode", mode)
         history = self.overlay.history()
         label = MODES.get(mode, MODES["solve"])[0]
-        self.overlay.add_message("user", question or f"◉ {label.title()} what's on my screen")
+        self.overlay.add_message("user", (question or f"◉ {label.title()} what's on my screen")
+                                 + ("\n\n*[screenshot]*" if image is not None and question else ""))
         message = self.overlay.add_message("assistant", "", streaming=True)
+        started = time.monotonic()
+        waiting = QTimer(self.overlay)
+        waiting.setInterval(1000)
+
+        def tick() -> None:
+            if message.text or not message.streaming:
+                waiting.stop()
+            else:
+                message.set_waiting(f"{wait_label} · {int(time.monotonic() - started)}s")
+
+        waiting.timeout.connect(tick)
         agent = dict(self.current_agent)
         models = self._models()
         class_name, lecture_name = self.current_scope
         prompt = build_screen_prompt(mode, question)
+        reader = (models.vision_model or "The vision model") if image is not None else models.chat_model
+        wait_label = f"{reader} is reading your screenshot" if image is not None else f"Waiting for {reader}"
 
         def work(progress: TaskReporter) -> dict:
             progress.watch(models, notices=False)
             sources: list[dict] = []  # the overlay only looks at the screen: no lecture notes
-            progress(f"{models.vision_model or 'The vision model'} is reading your screen…")
+            progress(f"{wait_label}…")
             try:
                 return models.stream_screen_answer(
                     prompt, image, sources, persona=agent["system_prompt"], num_ctx=CONTEXT_WINDOW,
@@ -2006,21 +2322,37 @@ class MainWindow(QMainWindow):
         self.screen_task = task
         task.progress.connect(lambda text: self.overlay.set_busy(True, text.upper()[:44], stoppable=True))
         task.chunk.connect(message.append_token)
+        task.chunk.connect(lambda _token: self._follow_overlay())
 
         def finished() -> None:
+            waiting.stop()
             self.screen_task = None
             self.overlay.set_busy(False)
             task.deleteLater()
             if task.error is not None:
                 message.kind = "error"
-                message.finish(f"⚠ {task.error}\n\nPick a vision model under ⬡ MODELS if you haven't yet.", [])
+                tip = "\n\nPick a vision model under ⬡ MODELS if you haven't yet." if image is not None else ""
+                message.finish(f"⚠ {task.error}{tip}", [])
             else:
                 message.finish(task.result["answer"], task.result["sources"])
             QTimer.singleShot(0, self.overlay.scroll_to_bottom)
 
         task.finished.connect(finished)
-        self.overlay.set_busy(True, "READING SCREEN…", stoppable=True)
+        self.overlay.set_busy(True, "READING SCREENSHOT…" if image is not None else "THINKING…", stoppable=True)
+        tick()
+        waiting.start()
         task.start()
+
+    def _follow_overlay(self) -> None:
+        """Keep the newest words in view while the overlay's answer streams in (at most ~10×/s)."""
+        if not self._overlay_scroll_pending:
+            self._overlay_scroll_pending = True
+
+            def scroll() -> None:
+                self._overlay_scroll_pending = False
+                self.overlay.scroll_to_bottom()
+
+            QTimer.singleShot(120, scroll)
 
     def stop_screen_answer(self) -> None:
         if self.screen_task is not None:

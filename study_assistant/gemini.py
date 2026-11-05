@@ -7,6 +7,7 @@ with no SDK to install. The API key comes from GEMINI_API_KEY or the macOS Keych
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import os
@@ -267,6 +268,50 @@ def health_label(name: str) -> str:
         return f"✓ {entry['seconds']:.1f}s"
     return {"missing": "✗ not available", "limited": "✗ rate limited", "busy": "✗ overloaded",
             "slow": "✗ no response"}.get(entry["kind"], "✗ error")
+
+
+def _unfinished_code(text: str) -> bool:
+    """True when the text ends inside a fenced code block (an odd number of ``` fences)."""
+    return sum(1 for line in text.splitlines() if line.lstrip().startswith("```")) % 2 == 1
+
+
+class _OverlapTrimmer:
+    """Passes a continuation's text on, minus any opening that repeats the end of what came before."""
+
+    HOLD = 160  # characters to hold back while checking for a repeated seam
+
+    def __init__(self, before: str, on_token) -> None:
+        self.before = before
+        self.on_token = on_token
+        self.held = ""
+        self.passed: list[str] = []
+        self.checked = False
+
+    def __call__(self, text: str) -> None:
+        if self.checked:
+            self._pass(text)
+            return
+        self.held += text
+        if len(self.held) >= self.HOLD:
+            self._release()
+
+    def _release(self) -> None:
+        self.checked = True
+        held, self.held = self.held, ""
+        tail = self.before[-self.HOLD:]
+        overlap = next((n for n in range(min(len(tail), len(held)), 7, -1) if tail.endswith(held[:n])), 0)
+        self._pass(held[overlap:])
+
+    def _pass(self, text: str) -> None:
+        if text:
+            self.passed.append(text)
+            if self.on_token:
+                self.on_token(text)
+
+    def finish(self) -> str:
+        if not self.checked:
+            self._release()
+        return "".join(self.passed)
 
 
 class GeminiClient:
@@ -669,28 +714,82 @@ class GeminiClient:
             if candidate.get("finishReason") in ("SAFETY", "RECITATION", "PROHIBITED_CONTENT") and not content:
                 raise OllamaError(f"Gemini declined to answer ({candidate['finishReason'].lower()}).")
 
+    MAX_CONTINUATIONS = 3
+    CUT_OFF_NOTE = ("\n\n*Gemini stopped before finishing this answer. Reply **continue** to get the rest.*")
+    CONTINUE_PROMPT = ("Your previous reply was cut off. Continue exactly where it stopped, mid-sentence or "
+                       "mid-code if need be. Don't repeat anything already written and don't restart the answer.")
+
+    def _cut_off(self, content: list[str], on_token) -> None:
+        """End an answer Gemini wouldn't finish: close any open code block, then say how to get the rest."""
+        note = ("\n```" if _unfinished_code("".join(content)) else "") + self.CUT_OFF_NOTE
+        content.append(note)
+        if on_token:
+            on_token(note)
+
     def _run(self, model, payload, on_token, on_thinking, retries: int = 2) -> ChatResult:
+        """Stream one answer. If Gemini stops before it's finished (its output limit, or the stream ending
+        early), ask it to carry on and join the pieces, so long solutions don't end halfway."""
         content, thinking = [], []
         usage: dict = {}
         block_reason = ""
         started = time.monotonic()  # speed includes the network wait: what the answer feels like
         last = None
-        try:
-            for chunk in self._stream(f"{_model_path(model)}:streamGenerateContent", payload, retries):
-                self._take_chunk(chunk, content, thinking, on_token, on_thinking)
-                usage = chunk.get("usageMetadata") or usage
-                block_reason = (chunk.get("promptFeedback") or {}).get("blockReason", block_reason)
-                if content:
-                    last = time.monotonic()
-        except (TimeoutError, OSError) as error:  # silence or a dropped connection mid-stream
-            if content:
-                raise OllamaError("The connection to Gemini dropped partway through the answer. Try again.") \
-                    from error
-            raise GeminiBusy(f"{model} didn't respond within {self.stream_timeout:.0f}s.") from error
+        output_tokens = 0
+        request = payload
+        json_reply = (payload.get("generationConfig") or {}).get("responseMimeType") == "application/json"
+        for attempt in range(self.MAX_CONTINUATIONS + 1):
+            piece: list[str] = []
+            # A continuation's first characters are held back until we know they don't repeat the end.
+            emit = on_token if attempt == 0 else _OverlapTrimmer("".join(content), on_token)
+            finish = ""
+            try:
+                for chunk in self._stream(f"{_model_path(model)}:streamGenerateContent", request,
+                                          retries if attempt == 0 else 1):
+                    self._take_chunk(chunk, piece, thinking, emit, on_thinking)
+                    usage = chunk.get("usageMetadata") or usage
+                    block_reason = (chunk.get("promptFeedback") or {}).get("blockReason", block_reason)
+                    finish = next((c.get("finishReason") for c in chunk.get("candidates") or []
+                                   if c.get("finishReason")), finish)
+                    if piece:
+                        last = time.monotonic()
+            except (TimeoutError, OSError, http.client.HTTPException, ValueError) as error:
+                # silence, a dropped connection, or a stream cut off mid-message
+                if not content and not piece:
+                    raise GeminiBusy(f"{model} didn't respond within {self.stream_timeout:.0f}s.") from error
+                finish = "DROPPED"
+            except OllamaError:
+                if not content:
+                    raise
+                # Asking it to carry on failed (busy, quota…): keep what's written rather than starting
+                # over with another model, and say so.
+                self._status(f"{model} couldn't finish the answer")
+                self._cut_off(content, on_token)
+                break
+            if attempt:
+                piece = [emit.finish()]
+            content.extend(piece)
+            output_tokens += int(usage.get("candidatesTokenCount") or 0)
+            so_far = "".join(content)
+            if finish == "STOP" and not json_reply and _unfinished_code(so_far):
+                finish = "UNCLOSED"  # it said it was done, but stopped inside a code block
+            # STOP is a finished answer; SAFETY etc. won't improve by asking again.
+            if not content or finish not in ("MAX_TOKENS", "DROPPED", "UNCLOSED", ""):
+                break
+            if not so_far.strip() or json_reply:
+                break
+            if attempt == self.MAX_CONTINUATIONS:
+                self._cut_off(content, on_token)
+                break
+            self._status(f"{model} " + ("hit its length limit" if finish == "MAX_TOKENS" else "stopped early")
+                         + " · continuing the answer")
+            request = {**payload, "contents": [
+                *payload["contents"],
+                {"role": "model", "parts": [{"text": so_far}]},
+                {"role": "user", "parts": [{"text": self.CONTINUE_PROMPT}]},
+            ]}
         if not content and not thinking:
             reason = f" ({block_reason.lower()})" if block_reason else ""
             raise OllamaError(f"Gemini returned an empty answer{reason}.")
-        output_tokens = int(usage.get("candidatesTokenCount") or 0)
         duration = int((last - started) * 1e9) if last and last > started else 0
         stats = ChatStats(
             model=model, eval_count=output_tokens, eval_duration_ns=duration,

@@ -1,12 +1,14 @@
-"""A translucent, always-on-top panel that reads the screen and works through what's on it.
+"""A translucent, always-on-top panel: take a screenshot when you choose, then ask about it (or just chat).
 
-It's an ordinary window: it shows in screen recordings and screen sharing like any other app.
+It's an ordinary window: it shows in screen recordings and screen sharing like any other app. It never
+captures anything on its own: a screenshot is taken only when you press SCREENSHOT / AREA (or the
+screenshot shortcut), and it's sent only when you press SEND.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import QByteArray, QPoint, QRectF, QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
@@ -81,7 +83,8 @@ class _DragHandle(QFrame):
 class ScreenOverlay(QWidget):
     """Floating, see-through study panel. The main window does the capturing and answering."""
 
-    read_requested = Signal(str, str, bool)  # question ("" = mode default), mode, pick an area?
+    capture_requested = Signal(bool)  # take a screenshot to attach: True = drag out an area
+    ask_requested = Signal(str, str, object)  # question ("" = mode default), mode, screenshot PNG or None
     stop_requested = Signal()
     settings_requested = Signal()
     source_opened = Signal(object)
@@ -96,11 +99,13 @@ class ScreenOverlay(QWidget):
         self.resize(440, 580)
         self.settings = settings
         self._panel_alpha = PANEL_OPACITY
-        self._accent = QColor(COLORS["cyan"])
+        self._accent = QColor(COLORS["cyan"])  # only the agent's tiny portrait uses it
+        self._edge = QColor(COLORS["border_hi"])  # a quiet grey outline, no neon
         self._placed = False
         self.agent_name = "Assistant"
         self.messages: list[ChatMessageWidget] = []
         self.busy = False
+        self._screenshot: bytes | None = None
         self.toggle_label = self.read_label = ""
         self.model_label = ""
         self._save_timer = QTimer(self)  # created first: the slider's setRange already emits valueChanged
@@ -170,29 +175,66 @@ class ScreenOverlay(QWidget):
         modes.addWidget(self.status)
         outer.addLayout(modes)
 
+        # The attached screenshot, shown small until it's sent (✕ removes it).
+        self.attachment = QFrame()
+        self.attachment.setObjectName("overlayAttachment")
+        attached = QHBoxLayout(self.attachment)
+        attached.setContentsMargins(4, 3, 2, 3)
+        attached.setSpacing(8)
+        self.thumbnail = QLabel()
+        attached.addWidget(self.thumbnail)
+        self.attachment_label = QLabel("Screenshot")
+        self.attachment_label.setObjectName("overlayHint")
+        attached.addWidget(self.attachment_label, 1)
+        remove = QPushButton("✕")
+        remove.setObjectName("ghostButton")
+        remove.setFixedSize(24, 22)
+        remove.setToolTip("Remove the screenshot")
+        remove.clicked.connect(self.clear_screenshot)
+        attached.addWidget(remove)
+        self.attachment.hide()
+        outer.addWidget(self.attachment)
+
         self.input = ComposerInput()
-        self.input.setPlaceholderText("Optional: ask something specific about it")
-        self.input.submitted.connect(lambda: self._submit(False))
+        self.input.setPlaceholderText("Ask about the screenshot, or anything else")
+        self.input.submitted.connect(self._send_or_stop)
         outer.addWidget(self.input)
         actions = QHBoxLayout()
         actions.setSpacing(6)
+        self.screenshot_button = QPushButton("◉ SCREENSHOT")
+        self.screenshot_button.setToolTip("Take one screenshot of this screen and attach it (nothing is sent yet)")
+        self.screenshot_button.clicked.connect(lambda: self.capture_requested.emit(False))
+        actions.addWidget(self.screenshot_button)
         self.area_button = QPushButton("⬚ AREA")
-        self.area_button.setToolTip("Drag out the part of the screen to read (Esc cancels)")
-        self.area_button.clicked.connect(lambda: self._submit(True))
+        self.area_button.setToolTip("Drag out part of the screen to attach (Esc cancels)")
+        self.area_button.clicked.connect(lambda: self.capture_requested.emit(True))
         actions.addWidget(self.area_button)
         actions.addStretch(1)
-        self.read_button = QPushButton("◉ READ SCREEN")
+        self.read_button = QPushButton("SEND ▸")  # (named read_button for older callers)
+        self.send_button = self.read_button
         self.read_button.setObjectName("sendButton")
-        self.read_button.clicked.connect(self._read_or_stop)
+        self.read_button.clicked.connect(self._send_or_stop)
         actions.addWidget(self.read_button)
         grip = QSizeGrip(self)
         actions.addWidget(grip, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
         outer.addLayout(actions)
 
         self.extra_css = f"""
-            #overlayHint {{ color: {COLORS['muted']}; font-size: 11px; }}
+            #overlayHint {{ color: {COLORS['muted']}; font-size: 12px; }}
             #overlayScroll, #overlayBody {{ background: transparent; border: none; }}
             #composerInput {{ background: rgba(0, 0, 0, 0.35); border: 1px solid {COLORS['border_hi']}; }}
+            #overlayAttachment {{ background: rgba(0, 0, 0, 0.35); border: 1px solid {COLORS['border_hi']}; }}
+            /* The overlay stays neutral: greys and white instead of the main window's neon. */
+            QPushButton:hover {{ border-color: {COLORS['muted']}; color: {COLORS['white']};
+                background: rgba(255, 255, 255, 0.06); }}
+            QPushButton:pressed {{ background: rgba(255, 255, 255, 0.12); }}
+            QPushButton:checked, #modeButton:checked {{ border-color: {COLORS['muted']}; color: {COLORS['white']};
+                background: rgba(255, 255, 255, 0.08); }}
+            #sendButton {{ background: {COLORS['text']}; color: #111; }}
+            #sendButton:hover {{ background: {COLORS['white']}; color: #000; }}
+            #ghostButton:hover {{ background: transparent; }}
+            QScrollBar::handle:vertical:hover {{ background: {COLORS['muted']}; }}
+            #sourceLink, #sourcesToggle {{ color: {COLORS['text']}; }}
         """
         self.setStyleSheet(self.extra_css)
         self._restoring = True
@@ -228,6 +270,13 @@ class ScreenOverlay(QWidget):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._save_timer.start()
+        self._fit_messages()
+
+    def _fit_messages(self) -> None:
+        """Keep every answer inside the panel's width (long lines wrap instead of running off the edge)."""
+        width = max(200, self.scroll.viewport().width() - 8)
+        for message in self.messages:
+            message.set_available_width(width)
 
     def hideEvent(self, event) -> None:  # noqa: N802
         self.save_state()
@@ -245,16 +294,18 @@ class ScreenOverlay(QWidget):
     def set_shortcuts(self, toggle_label: str, read_label: str) -> None:
         """Show the current global shortcuts in the hint and tooltips ("" or "OFF" when unset)."""
         self.toggle_label, self.read_label = toggle_label, read_label
-        parts = ["Put a problem on screen, then press READ SCREEN, or AREA to pick just part of it."]
+        parts = ["Press SCREENSHOT (or AREA for part of the screen) to attach what you're looking at, then "
+                 "SEND. Nothing is captured until you press one of them. You can also just type a question."]
         if toggle_label and toggle_label != "OFF":
             parts.append(f"{toggle_label} shows or hides this panel from any app.")
         if read_label and read_label != "OFF":
-            parts.append(f"{read_label} reads the screen straight away.")
+            parts.append(f"{read_label} takes a screenshot from any app.")
         self.hint.setText(" ".join(parts))
         self.close_button.setToolTip(f"Hide ({toggle_label} brings it back)" if toggle_label not in ("", "OFF")
                                      else "Hide")
-        self.read_button.setToolTip(f"Read the whole screen ({read_label})" if read_label not in ("", "OFF")
-                                    else "Read the whole screen")
+        self.screenshot_button.setToolTip(
+            "Take one screenshot of this screen and attach it (nothing is sent yet)"
+            + (f" · {read_label}" if read_label not in ("", "OFF") else ""))
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -265,7 +316,7 @@ class ScreenOverlay(QWidget):
         fill = QColor(COLORS["bg"])
         fill.setAlphaF(self._panel_alpha)
         painter.fillPath(path, fill)
-        border = QColor(self._accent)
+        border = QColor(self._edge)
         border.setAlphaF(0.55)
         painter.setPen(QPen(border, 1))
         painter.drawPath(path)
@@ -305,24 +356,47 @@ class ScreenOverlay(QWidget):
     def mode(self) -> str:
         return next((key for key, button in self.mode_buttons.items() if button.isChecked()), "solve")
 
-    def _read_or_stop(self) -> None:
+    def _send_or_stop(self) -> None:
         if self.busy:
             self.stop_requested.emit()
-        else:
-            self._submit(False)
-
-    def _submit(self, pick_area: bool) -> None:
-        if self.busy:
             return
         question = self.input.text().strip()
+        if not question and self._screenshot is None:
+            self.status.setText("TAKE A SCREENSHOT OR TYPE A QUESTION")
+            return
+        image = self._screenshot
         self.input.clear()
-        self.read_requested.emit(question, self.mode(), pick_area)
+        self.clear_screenshot()
+        self.ask_requested.emit(question, self.mode(), image)
+
+    # -- the attached screenshot ------------------------------------------------------------------
+    def attach_screenshot(self, png: bytes) -> None:
+        self._screenshot = png
+        pixmap = QPixmap()
+        pixmap.loadFromData(png)
+        if not pixmap.isNull():
+            # A slim one-line chip, so a small overlay keeps its room for the answer.
+            self.thumbnail.setPixmap(pixmap.scaledToHeight(24, Qt.TransformationMode.SmoothTransformation))
+            self.attachment_label.setText(f"Screenshot · {pixmap.width()}×{pixmap.height()}")
+            self.attachment.setToolTip("Attached to your next message. Ask about it, or press SEND for the "
+                                       "mode's default. ✕ removes it.")
+        self.attachment.show()
+        self.input.setFocus()
+
+    def screenshot(self) -> bytes | None:
+        return self._screenshot
+
+    def clear_screenshot(self) -> None:
+        self._screenshot = None
+        self.thumbnail.clear()
+        self.attachment.hide()
 
     def set_busy(self, busy: bool, status: str = "", stoppable: bool = False) -> None:
         self.busy = busy
         self.area_button.setEnabled(not busy)
+        self.screenshot_button.setEnabled(not busy)
         self.read_button.setEnabled(not busy or stoppable)
-        self.read_button.setText("■ STOP" if busy and stoppable else "◉ READ SCREEN")
+        self.read_button.setText("■ STOP" if busy and stoppable else "SEND ▸")
         if busy:
             self.status.setText(status)
         else:
@@ -332,12 +406,15 @@ class ScreenOverlay(QWidget):
         self.hint.hide()
         message = ChatMessageWidget(role, text, None, self, agent_name=self.agent_name,
                                     accent=self._accent.name(), streaming=streaming)
+        message.neutral = True  # no neon accents inside the overlay
+        message._render_body()
         if role == "assistant":
             message.action_buttons["regenerate"].hide()
             message.action_buttons["explain"].hide()
         message.source_opened.connect(self.source_opened.emit)
         self.body_layout.insertWidget(self.body_layout.count() - 1, message)
         self.messages.append(message)
+        self._fit_messages()
         QTimer.singleShot(0, self.scroll_to_bottom)
         return message
 

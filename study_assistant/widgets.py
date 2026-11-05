@@ -6,8 +6,8 @@ import hashlib
 import math
 import random
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QKeyEvent, QPainter, QPen
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QKeyEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -17,12 +17,14 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
 
 from .ollama import source_label
-from .rich_text import render_markdown
+from .rich_text import COPY_LINK, code_blocks, render_markdown
 from .theme import ACCENTS, COLORS, mono_family
 
 
@@ -260,7 +262,9 @@ class ChatMessageWidget(QFrame):
         self.streaming = streaming
         self.accent = accent
         self.setObjectName("assistantMessage" if role == "assistant" else "userMessage")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        # Preferred, not Minimum: with Minimum the height estimated for some other width became a floor,
+        # and those overestimates stacked up into blank space below reopened conversations.
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 4, 0, 4)
@@ -307,7 +311,9 @@ class ChatMessageWidget(QFrame):
             Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
         )
         self.body.setOpenExternalLinks(False)
-        self.body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.body.linkActivated.connect(self._link_clicked)
+        self._copied_block: int | None = None
+        self.body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         if role == "user":
             bubble = QFrame()
             bubble.setObjectName("userBubble")
@@ -365,9 +371,20 @@ class ChatMessageWidget(QFrame):
         self.retrieval_label.setText(f"◆ {text}" if text else "")
         self.retrieval_label.setVisible(bool(text))
 
+    RENDER_INTERVAL_MS = 90  # while streaming, redraw at most ~11×/s however fast words arrive
+
     def append_token(self, token: str) -> None:
+        # Rendering re-lays out the whole answer (Markdown, highlighted code, math), so doing it per
+        # token froze the window on long answers. Words are kept immediately; drawing is batched.
         self.text += token
-        self._render_body()
+        if not getattr(self, "_render_pending", False):
+            self._render_pending = True
+            QTimer.singleShot(self.RENDER_INTERVAL_MS, self._render_soon)
+
+    def _render_soon(self) -> None:
+        self._render_pending = False
+        if self.streaming:
+            self._render_body()
 
     def append_thinking(self, token: str) -> None:
         self.thinking += token
@@ -394,7 +411,29 @@ class ChatMessageWidget(QFrame):
         if self.role == "user":
             self.body.setText(markdown)
         else:
-            self.body.setText(render_markdown(markdown, COLORS, mono_family()))
+            colors = {**COLORS, "cyan": COLORS["muted"]} if getattr(self, "neutral", False) else COLORS
+            self.body.setText(render_markdown(markdown, colors, mono_family(), copy_links=not self.streaming,
+                                              copied=self._copied_block))
+
+    def _link_clicked(self, link: str) -> None:
+        """A code block's ⧉ COPY: put exactly that block's code on the clipboard."""
+        if not link.startswith(COPY_LINK):
+            return
+        try:
+            index = int(link.removeprefix(COPY_LINK))
+            code = code_blocks(self.text)[index]
+        except (ValueError, IndexError):
+            return
+        QApplication.clipboard().setText(code)
+        self._copied_block = index
+        self._render_body()
+
+        def reset() -> None:
+            if self._copied_block == index:
+                self._copied_block = None
+                self._render_body()
+
+        QTimer.singleShot(1500, reset)
 
     def set_waiting(self, text: str) -> None:
         """While nothing has streamed yet, say what we're waiting on (and for how long)."""
@@ -516,3 +555,103 @@ class MeterBar(QWidget):
         filled = self.rect().adjusted(0, 0, -int(self.width() * (1 - self._value)), 0)
         painter.fillRect(filled, QColor(COLORS["cyan"]))
         painter.end()
+
+
+# ---------------------------------------------------------------------------------------------
+# Course navigator rows
+# ---------------------------------------------------------------------------------------------
+
+NAV_KIND = Qt.ItemDataRole.UserRole + 1  # "all" | "course" | "lecture"
+NAV_DETAIL = Qt.ItemDataRole.UserRole + 2  # small right-aligned note: page or lecture count
+
+
+class NavigatorDelegate(QStyledItemDelegate):
+    """Draws the course list: soft rounded selection with a slim accent marker, bold course rows with
+    a chevron (click it to fold the course), indented lectures with their page count on the right."""
+
+    CHEVRON_WIDTH = 26
+
+    def __init__(self, sans: str, mono: str, parent=None) -> None:
+        super().__init__(parent)
+        self.sans, self.mono = sans, mono
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802
+        kind = index.data(NAV_KIND)
+        return QSize(option.rect.width(), 30 if kind == "lecture" else 36)
+
+    def editorEvent(self, event, model, option, index) -> bool:  # noqa: N802
+        # A click on a course's chevron folds or unfolds it (the row itself still selects the course).
+        if (event.type() == QEvent.Type.MouseButtonRelease and index.data(NAV_KIND) == "course"
+                and event.position().x() < option.rect.left() + self.CHEVRON_WIDTH):
+            tree = option.widget
+            tree.setExpanded(index, not tree.isExpanded(index))
+            return True
+        return super().editorEvent(event, model, option, index)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        kind = index.data(NAV_KIND) or "lecture"
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(option.rect).adjusted(2, 2, -2, -2)
+        if selected or hovered:
+            path = QPainterPath()
+            path.addRoundedRect(rect, 6, 6)
+            painter.fillPath(path, QColor(COLORS["card"] if selected else COLORS["raised"]))
+        if selected:  # slim accent marker, inset from the corners
+            marker = QRectF(rect.left() + 1, rect.top() + rect.height() * 0.25, 3, rect.height() * 0.5)
+            path = QPainterPath()
+            path.addRoundedRect(marker, 1.5, 1.5)
+            painter.fillPath(path, QColor(COLORS["cyan"]))
+
+        x = rect.left() + 12
+        right = rect.right() - 10
+        middle = rect.center().y()
+        if kind == "course":
+            tree = option.widget
+            expanded = tree.isExpanded(index) if tree is not None else True
+            pen = QPen(QColor(COLORS["muted"]), 1.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            cx = x + 4
+            if expanded:  # ▾
+                painter.drawPolyline([QPointF(cx - 4, middle - 2), QPointF(cx, middle + 2), QPointF(cx + 4, middle - 2)])
+            else:  # ▸
+                painter.drawPolyline([QPointF(cx - 2, middle - 4), QPointF(cx + 2, middle), QPointF(cx - 2, middle + 4)])
+            x += self.CHEVRON_WIDTH - 10
+        elif kind == "all":
+            painter.setPen(QPen(QColor(COLORS["cyan"] if selected else COLORS["muted"]), 1.4))
+            painter.setBrush(QColor(COLORS["cyan"]) if selected else Qt.BrushStyle.NoBrush)
+            size = 4.5
+            painter.drawPolygon([QPointF(x + 4, middle - size), QPointF(x + 4 + size, middle),
+                                 QPointF(x + 4, middle + size), QPointF(x + 4 - size, middle)])
+            x += 16
+        else:
+            x += 18  # lectures sit under their course's name
+
+        detail = index.data(NAV_DETAIL) or ""
+        if detail:
+            small = QFont(self.mono)
+            small.setPixelSize(11)
+            painter.setFont(small)
+            painter.setPen(QColor(COLORS["muted"] if selected else COLORS["dim"]))
+            width = QFontMetrics(small).horizontalAdvance(detail)
+            painter.drawText(QRectF(right - width, rect.top(), width, rect.height()),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, detail)
+            right -= width + 10
+
+        font = QFont(self.sans)
+        font.setPixelSize(14 if kind != "lecture" else 13)
+        font.setWeight(QFont.Weight.DemiBold if kind != "lecture" else QFont.Weight.Normal)
+        painter.setFont(font)
+        colour = COLORS["white"] if selected else (COLORS["text"] if kind != "lecture" else COLORS["muted"])
+        if hovered and not selected:
+            colour = COLORS["white"]
+        painter.setPen(QColor(colour))
+        name = QFontMetrics(font).elidedText(index.data(Qt.ItemDataRole.DisplayRole) or "",
+                                             Qt.TextElideMode.ElideRight, int(right - x))
+        painter.drawText(QRectF(x, rect.top(), right - x, rect.height()),
+                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
+        painter.restore()

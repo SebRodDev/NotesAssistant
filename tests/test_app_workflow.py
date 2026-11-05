@@ -77,10 +77,13 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.assertEqual(len(window.agent_cards), 3)
         self.assertEqual(window.agent_title.text(), "TUTOR")
         self.assertEqual(window.panel_name.text(), "TUTOR")
-        self.assertEqual(window.navigator.topLevelItemCount(), 2)
+        self.assertEqual(window.navigator.topLevelItemCount(), 1)  # just the course: no "All materials"
+        self.assertEqual(window.current_scope, ("CS 354", None))  # opens on the first course
         self.assertIn("3 PAGES", window.library_status.text())
         self.assertIn("0 indexed for search", window.library_status.toolTip())
-        self.assertEqual(window.message_widgets[0].kind, "intro")
+        self.assertEqual(window.message_widgets, [])  # opens on the welcome screen
+        self.assertFalse(window.welcome.isHidden())
+        self.assertTrue(window.chat_scroll.isHidden())
         self.assertTrue(window.right_panel.isHidden())  # only opens to preview a cited page
         window.show_link_card()  # the header badge opens the agent card
         self.assertTrue(window.link_card.isVisible())
@@ -88,7 +91,7 @@ class DesktopWorkflowTests(unittest.TestCase):
 
     def test_find_page_and_source_opens_in_right_panel(self) -> None:
         window = self.window()
-        class_item = window.navigator.topLevelItem(1)
+        class_item = window.navigator.topLevelItem(0)
         window.navigator.setCurrentItem(class_item.child(0))
         self.assertEqual(window.scope_title.text(), "CS 354 · SCHEDULING")
         window.set_mode("find")
@@ -108,7 +111,7 @@ class DesktopWorkflowTests(unittest.TestCase):
     def test_ask_streams_answer_with_citations_and_stats(self) -> None:
         fake = self.fake_server()
         window = self.window(fake.host)
-        window.navigator.setCurrentItem(window.navigator.topLevelItem(1))
+        window.navigator.setCurrentItem(window.navigator.topLevelItem(0))
         window.query.setText("What is priority inversion?")
         window.send_message()
         self.assertIsNotNone(window.active_task)
@@ -163,12 +166,13 @@ class DesktopWorkflowTests(unittest.TestCase):
 
     def test_agents_switch_conversations_and_can_be_created(self) -> None:
         window = self.window()
-        window.navigator.setCurrentItem(window.navigator.topLevelItem(1))
-        tutor_intro = window.message_widgets[0].text
+        window.navigator.setCurrentItem(window.navigator.topLevelItem(0))
+        tutor_intro = window.welcome_subtitle.text()
         explainer = window.library.agents()[1]
         window.select_agent(explainer["id"])
         self.assertEqual(window.agent_title.text(), "EXPLAINER")
-        self.assertNotEqual(window.message_widgets[0].text, tutor_intro)
+        self.assertNotEqual(window.welcome_subtitle.text(), tutor_intro)
+        self.assertIn("Explainer", window.welcome_subtitle.text())
         self.assertEqual(self.settings.value("agents/current", type=int), explainer["id"])
 
         dialog = AgentEditorDialog(None, ["qwen3:8b", "nomic-embed-text:latest"], "qwen3:8b", window)
@@ -307,7 +311,7 @@ class DesktopWorkflowTests(unittest.TestCase):
 
     def test_last_study_space_and_agent_are_restored(self) -> None:
         window = self.window()
-        window.navigator.setCurrentItem(window.navigator.topLevelItem(1).child(0))
+        window.navigator.setCurrentItem(window.navigator.topLevelItem(0).child(0))
         window.select_agent(window.library.agents()[2]["id"])
         window.close()
         reopened_library = Library(Path(self.temp_dir.name) / "library.sqlite3")
@@ -316,6 +320,106 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.addCleanup(reopened.close)
         self.assertEqual(reopened.current_scope, ("CS 354", "Scheduling"))
         self.assertEqual(reopened.current_agent["name"], "Free chat")
+
+    def test_launch_shows_the_welcome_screen_with_suggestions_and_a_way_back(self) -> None:
+        self.settings.setValue("study_space/class", "CS 354")
+        agent = self.library.agents()[0]["id"]
+        self.library.save_class_chat("CS 354", "Earlier question", "Earlier answer", [], agent)
+        window = self.window()
+        self.assertEqual(window.message_widgets, [])  # not dropped straight into the old chat
+        self.assertFalse(window.welcome.isHidden())
+        self.assertIn("What would you like to study?", window.welcome_title.text())
+        self.assertFalse(window.resume_button.isHidden())
+        window.resume_button.click()
+        self.assertEqual([m.text for m in window.message_widgets], ["Earlier question", "Earlier answer"])
+        self.assertTrue(window.welcome.isHidden())
+        self.assertFalse(window.chat_scroll.isHidden())
+        window.navigator.setCurrentItem(window.navigator.topLevelItem(0).child(0))  # an empty lecture
+        self.assertFalse(window.welcome.isHidden())
+        self.assertTrue(window.resume_button.isHidden())  # nothing to resume there
+        with patch.object(window, "send_message") as send:
+            window.suggestion_buttons[0].click()
+        send.assert_called_once()
+        self.assertIn("Summarize the key ideas of CS 354 · Scheduling", window.query.text())
+
+    def test_course_rows_carry_counts_and_fold_from_the_chevron(self) -> None:
+        window = self.window()
+        course = window.navigator.topLevelItem(0)
+        self.assertEqual(course.text(0), "CS 354")
+        self.assertEqual(course.data(0, app_module.NAV_KIND), "course")
+        self.assertEqual(course.data(0, app_module.NAV_DETAIL), "1 lecture")
+        self.assertEqual(course.child(0).data(0, app_module.NAV_DETAIL), "3 pages")
+        window.resize(1200, 800)
+        window.show()
+        self.application.processEvents()
+        rect = window.navigator.visualItemRect(course)
+        point = app_module.QPoint(rect.left() + 8, rect.center().y())
+        from PySide6.QtTest import QTest
+
+        QTest.mouseClick(window.navigator.viewport(), Qt.MouseButton.LeftButton, pos=point)
+        self.assertFalse(course.isExpanded())  # the chevron folds it
+        QTest.mouseClick(window.navigator.viewport(), Qt.MouseButton.LeftButton, pos=point)
+        self.assertTrue(course.isExpanded())
+
+    def test_sidebar_collapses_and_remembers(self) -> None:
+        window = self.window()
+        self.assertFalse(window.sidebar_scroll.isHidden())
+        self.assertTrue(window.rail.isHidden())
+        window.collapse_button.click()  # « on the sidebar itself
+        self.assertTrue(window.sidebar_scroll.isHidden())
+        self.assertFalse(window.rail.isHidden())  # a slim bar of icons stays
+        self.assertEqual(len(window.rail_agent_buttons), len(self.library.agents()))
+        explainer = self.library.agents()[1]
+        window.rail_agent_buttons[1].findChild(app_module.AgentAvatar).clicked.emit()  # switch from the rail
+        self.assertEqual(window.current_agent["id"], explainer["id"])
+        self.assertTrue(window.rail_agent_buttons[1].property("active"))
+        reopened = MainWindow(self.library, settings=self.settings, start_monitor=False)
+        self.addCleanup(reopened.close)
+        self.assertTrue(reopened.sidebar_scroll.isHidden())  # remembered
+        reopened.sidebar_button.click()  # » on the rail
+        self.assertFalse(reopened.sidebar_scroll.isHidden())
+        self.assertTrue(reopened.rail.isHidden())
+
+    def test_reopened_conversations_open_at_the_latest_message_without_blank_space(self) -> None:
+        window = self.window()
+        agent = window.current_agent["id"]
+        long = "Priority inversion happens when a low-priority task holds a lock. " * 12
+        for i in range(8):
+            self.library.save_class_chat("CS 354", f"Question {i}", long, [], agent)
+        window.resize(1200, 800)
+        window.show()
+        window.navigator.itemClicked.emit(window.navigator.topLevelItem(0), 0)  # the course it opened on
+        for _ in range(30):
+            self.application.processEvents()
+        bar = window.chat_scroll.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 0)
+        self.assertEqual(bar.value(), bar.maximum())  # lands on the newest messages
+        last = window.message_widgets[-1]
+        bottom = last.mapTo(window.chat_body, last.rect().bottomLeft()).y()
+        self.assertLess(window.chat_body.height() - bottom, 60)  # no scrollable emptiness below
+
+    def test_lecture_and_course_keep_separate_conversations(self) -> None:
+        window, fake = self.gemini_window()
+        self.select_lecture(window)
+        self.ask(window, "What is priority inversion in this lecture?")
+        agent_id = window.current_agent["id"]
+        saved = self.library.class_chat_history("CS 354", agent_id=agent_id, lecture_name="Scheduling")
+        self.assertEqual([h["question"] for h in saved], ["What is priority inversion in this lecture?"])
+        window.navigator.setCurrentItem(window.navigator.topLevelItem(0))  # the whole course
+        texts = [m.text for m in window.message_widgets]
+        self.assertNotIn("What is priority inversion in this lecture?", texts)  # not merged in
+        self.ask(window, "Summarise the course")
+        # A restart restores each conversation under its own selection.
+        reopened = MainWindow(self.library, settings=self.settings, start_monitor=False)
+        self.addCleanup(reopened.close)
+        reopened.navigator.setCurrentItem(reopened.navigator.topLevelItem(0).child(0))
+        texts = [m.text for m in reopened.message_widgets]
+        self.assertIn("What is priority inversion in this lecture?", texts)
+        self.assertNotIn("Summarise the course", texts)
+        reopened.navigator.setCurrentItem(reopened.navigator.topLevelItem(0))
+        texts = [m.text for m in reopened.message_widgets]
+        self.assertIn("Summarise the course", texts)
+        self.assertNotIn("What is priority inversion in this lecture?", texts)
 
     def test_chats_do_not_leak_across_classes_and_saved_history_restores(self) -> None:
         agent_id = self.library.agents()[0]["id"]
@@ -329,12 +433,12 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.library.import_pdf("CS 182", "Memory", other_pdf, extract_page_texts(other_pdf))
         window = self.window()
         items = {window.navigator.topLevelItem(i).text(0): window.navigator.topLevelItem(i)
-                 for i in range(1, window.navigator.topLevelItemCount())}
+                 for i in range(window.navigator.topLevelItemCount())}
         window.navigator.setCurrentItem(items["CS 354"])
         self.assertEqual(window.message_widgets[0].text, "What is priority inversion?")
         window.navigator.setCurrentItem(items["CS 182"])
-        self.assertEqual(len(window.message_widgets), 1)
-        self.assertIn("CS 182", window.message_widgets[0].text)
+        self.assertEqual(window.message_widgets, [])  # nothing saved here: the welcome screen
+        self.assertIn("CS 182", window.welcome_subtitle.text())
         window.navigator.setCurrentItem(items["CS 354"])
         self.assertEqual(window.message_widgets[0].text, "What is priority inversion?")
 
@@ -419,34 +523,42 @@ class DesktopWorkflowTests(unittest.TestCase):
     def wait_for_screen(self, window: MainWindow) -> None:
         deadline = time.time() + 20
         self.application.processEvents()
-        while (window.screen_task is not None or window.overlay.busy) and time.time() < deadline:
+        while (window.screen_task is not None or window.overlay.busy or window._capturing) and time.time() < deadline:
             self.application.processEvents()
             time.sleep(0.01)
         self.application.processEvents()
 
-    def test_overlay_reads_the_screen_with_the_vision_model(self) -> None:
+    def test_overlay_screenshot_is_only_taken_and_sent_when_asked(self) -> None:
         fake = self.fake_server()
         window = self.window(fake.host)
         window.toggle_overlay()
         self.assertTrue(window.overlay.isVisible())
         self.assertTrue(window.overlay.testAttribute(app_module.Qt.WidgetAttribute.WA_TranslucentBackground))
+        self.assertEqual(window.overlay.attachment.isHidden(), True)  # opening it captures nothing
         captured = []
 
         def capture(x, y, w, h):
-            captured.append(window.overlay.isVisible())  # the overlay hides itself first
+            # out of the shot by fading, not hiding (hiding brings the main window to the front)
+            captured.append((window.overlay.isVisible(), window.overlay.windowOpacity()))
             return self._png()
 
         with (
             patch.object(app_module, "screen_capture_allowed", return_value=True),
             patch.object(app_module, "capture_region", side_effect=capture),
         ):
-            window.overlay.input.setText("How does priority inversion apply here?")
-            window.overlay.read_button.click()
+            window.overlay.screenshot_button.click()
             self.wait_for_screen(window)
-        self.assertEqual(captured, [False])
-        self.assertTrue(window.overlay.isVisible())
+        self.assertEqual(captured, [(True, 0.0)])
+        self.assertEqual(window.overlay.windowOpacity(), 1.0)
+        self.assertFalse(window.overlay.attachment.isHidden())  # attached, not sent
+        self.assertEqual(window.overlay.messages, [])
+        self.assertFalse(any(r.get("messages") for r in fake.requests if r.get("path") == "/api/chat"))
+        window.overlay.input.setText("How does priority inversion apply here?")
+        window.overlay.send_button.click()
+        self.wait_for_screen(window)
+        self.assertIsNone(window.overlay.screenshot())  # sent once, then cleared
         user, answer = window.overlay.messages[-2:]
-        self.assertEqual(user.text, "How does priority inversion apply here?")
+        self.assertTrue(user.text.startswith("How does priority inversion apply here?"))
         self.assertIn("Priority inversion", answer.text)
         request = fake.requests[-1]
         self.assertEqual(request["model"], "qwen2.5vl:7b")
@@ -455,18 +567,36 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.assertLessEqual(max(sent.width(), sent.height()), 1600)  # Retina captures are downscaled
         self.assertNotIn("lecture-note excerpts", request["messages"][-1]["content"].casefold())  # screen only
         self.assertNotIn("scheduling and priority inversion", str(request["messages"]).casefold())
-        # follow-ups carry the overlay's own history
+        # A new screenshot with no text asks the mode's default; follow-ups carry the overlay's history.
         with (
             patch.object(app_module, "screen_capture_allowed", return_value=True),
             patch.object(app_module, "capture_region", return_value=self._png()),
         ):
-            window.overlay.read_button.click()
+            window.overlay.screenshot_button.click()
             self.wait_for_screen(window)
+        window.overlay.send_button.click()
+        self.wait_for_screen(window)
         self.assertEqual(window.overlay.messages[-2].text, "◉ Solve what's on my screen")
         roles = [m["role"] for m in fake.requests[-1]["messages"]]
         self.assertEqual(roles, ["system", "user", "assistant", "user"])
         window.overlay.clear()
         self.assertEqual(window.overlay.messages, [])
+
+    def test_overlay_answers_typed_questions_without_capturing(self) -> None:
+        fake = self.fake_server()
+        window = self.window(fake.host)
+        window.toggle_overlay()
+        window.overlay.send_button.click()  # nothing typed, nothing attached: nothing happens
+        self.assertEqual(window.overlay.messages, [])
+        with patch.object(app_module, "capture_region") as capture:
+            window.overlay.input.setText("What's a monotonic stack?")
+            window.overlay.input.submitted.emit()
+            self.wait_for_screen(window)
+        capture.assert_not_called()
+        request = fake.requests[-1]
+        self.assertNotIn("images", request["messages"][-1])
+        self.assertEqual(request["model"], window._models().chat_model)
+        self.assertIn("Priority inversion", window.overlay.messages[-1].text)
 
     def test_overlay_asks_for_screen_recording_permission(self) -> None:
         window = self.window()
@@ -492,6 +622,7 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.assertIn("denied", window.overlay.messages[-1].text)
         self.assertFalse(window.overlay.busy)
         self.assertTrue(window.overlay.read_button.isEnabled())
+        self.assertEqual(window.overlay.windowOpacity(), 1.0)
 
     def test_overlay_without_a_vision_model_explains_what_to_install(self) -> None:
         fake = self.fake_server()
@@ -583,6 +714,8 @@ class DesktopWorkflowTests(unittest.TestCase):
             patch.object(app_module, "screen_capture_allowed", return_value=True),
             patch.object(app_module, "capture_region", return_value=self._png()),
         ):
+            window.overlay.screenshot_button.click()
+            self.wait_for_screen(window)
             window.overlay.read_button.click()
             self.wait_for_screen(window)
         self.assertIn("without the full solution", fake.requests[-1]["messages"][-1]["content"])
@@ -602,6 +735,7 @@ class DesktopWorkflowTests(unittest.TestCase):
             self.wait_for_screen(window)
         full_screen.assert_not_called()
         self.assertEqual(window.overlay.messages, [])  # Esc: nothing asked
+        self.assertIsNone(window.overlay.screenshot())
         self.assertTrue(window.overlay.isVisible())
         self.assertFalse(window.overlay.busy)
         with (
@@ -610,6 +744,10 @@ class DesktopWorkflowTests(unittest.TestCase):
         ):
             window.overlay.area_button.click()
             self.wait_for_screen(window)
+        self.assertIsNotNone(window.overlay.screenshot())
+        self.assertEqual(window.overlay.messages, [])  # attached, waiting for SEND
+        window.overlay.read_button.click()
+        self.wait_for_screen(window)
         self.assertIn("Priority inversion", window.overlay.messages[-1].text)
         self.assertTrue(fake.requests[-1]["messages"][-1]["images"])
 
@@ -635,7 +773,7 @@ class DesktopWorkflowTests(unittest.TestCase):
         answer = window.overlay.messages[-1]
         self.assertTrue(answer.text.endswith("*Stopped.*"))
         self.assertNotIn("[S9]", answer.text)
-        self.assertEqual(window.overlay.read_button.text(), "◉ READ SCREEN")
+        self.assertEqual(window.overlay.read_button.text(), "SEND ▸")
 
     def test_stop_ends_a_chat_answer(self) -> None:
         fake = self.fake_server(token_delay=0.05)
@@ -720,7 +858,7 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.assertEqual(window.provider, "gemini")
         self.assertEqual(window.footer_label.text(), "◆ CLOUD · GEMINI API")
         self.assertEqual(window.stat_runtime.text(), "CLOUD")
-        window.navigator.setCurrentItem(window.navigator.topLevelItem(1))
+        window.navigator.setCurrentItem(window.navigator.topLevelItem(0))
         window.query.setText("What is priority inversion?")
         window.send_message()
         self.wait(window)
@@ -851,7 +989,7 @@ class DesktopWorkflowTests(unittest.TestCase):
 
     # -- answering from the selected lecture, and explaining empty answers ---------------------
     def select_lecture(self, window: MainWindow) -> None:
-        window.navigator.setCurrentItem(window.navigator.topLevelItem(1).child(0))
+        window.navigator.setCurrentItem(window.navigator.topLevelItem(0).child(0))
 
     def ask(self, window: MainWindow, question: str) -> str:
         window.query.setText(question)
@@ -889,7 +1027,7 @@ class DesktopWorkflowTests(unittest.TestCase):
         document.close()
         self.library.import_pdf("CS 354", "Semaphores", path, extract_page_texts(path))
         window, fake = self.gemini_window()
-        window.navigator.setCurrentItem(window.navigator.topLevelItem(1))  # the course folder
+        window.navigator.setCurrentItem(window.navigator.topLevelItem(0))  # the course folder
         self.ask(window, "Summarize the course so far")
         self.assertEqual(window.message_widgets[-1].retrieval_label.text(), "◆ READ ALL 3 PAGES OF CS 354 · 2 LECTURES")
         prompt = [r for r in fake.requests if r["path"].endswith(":streamGenerateContent")][-1]["systemInstruction"]["parts"][0]["text"]
@@ -898,7 +1036,7 @@ class DesktopWorkflowTests(unittest.TestCase):
     def test_courses_too_big_to_send_whole_use_the_most_relevant_pages(self) -> None:
         window, fake = self.gemini_window()
         window.SCOPE_CHARS = {"gemini": 150}  # pretend only one page fits
-        window.navigator.setCurrentItem(window.navigator.topLevelItem(1))
+        window.navigator.setCurrentItem(window.navigator.topLevelItem(0))
         self.ask(window, "mutexes")
         self.assertTrue(window.message_widgets[-1].retrieval_label.text().startswith(
             "◆ READ 1 MOST RELEVANT OF 2 PAGES IN CS 354"))
@@ -916,7 +1054,7 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.library.import_pdf("MA 416", "Week 1", path, extract_page_texts(path))
         window = self.window()
         items = {window.navigator.topLevelItem(i).text(0): window.navigator.topLevelItem(i)
-                 for i in range(1, window.navigator.topLevelItemCount())}
+                 for i in range(window.navigator.topLevelItemCount())}
         window.navigator.setCurrentItem(items["MA 416"].child(0))
         self.assertIn("none of them has selectable text", self.ask(window, "Summarize this lecture"))
 
@@ -929,7 +1067,7 @@ class DesktopWorkflowTests(unittest.TestCase):
     def test_sidebar_shows_what_is_saved_and_what_needs_indexing(self) -> None:
         window = self.window()
         self.assertTrue(window.library_status.text().startswith(
-            "CONTEXT: WHOLE LIBRARY\n3 PAGES\nALL SENT WITH EACH QUESTION"))
+            "CONTEXT: CS 354\n3 PAGES\nALL SENT WITH EACH QUESTION"))
         self.assertEqual(window.index_button.text(), "⟳ INDEX 3 NEW PAGES")
         self.select_lecture(window)  # the summary follows the selection
         self.assertTrue(window.library_status.text().startswith("CONTEXT: SCHEDULING\n3 PAGES"))
@@ -979,7 +1117,7 @@ class DesktopWorkflowTests(unittest.TestCase):
         window.SCOPE_CHARS = {"gemini": 100}  # too big to send whole, so it searches
         window.index_library()
         self.wait(window)
-        window.navigator.setCurrentItem(window.navigator.topLevelItem(1))
+        window.navigator.setCurrentItem(window.navigator.topLevelItem(0))
         self.ask(window, "What is priority inversion?")
         self.ask(window, "And how is it fixed?")
         query = [r for r in fake.requests if r["path"].endswith(":batchEmbedContents")][-1]

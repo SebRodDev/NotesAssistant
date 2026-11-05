@@ -50,6 +50,56 @@ class GeminiClientTests(unittest.TestCase):
         self.assertEqual([turn["role"] for turn in request["contents"]], ["user", "model", "user"])
         self.assertGreater(result["tokens_per_second"], 0)
 
+    def test_answers_cut_off_partway_are_continued_seamlessly(self) -> None:
+        full = " ".join(f"word{i}" for i in range(60))
+        for how in ("max", "silent"):  # hit the output limit / stream ended without finishing
+            with self.subTest(how=how):
+                self.fake.answer = full
+                self.fake.truncate = (how, 25)
+                tokens, statuses = [], []
+                self.client.on_status = statuses.append
+                result = self.client.chat("gemini-flash-latest", [{"role": "user", "content": "Solve it"}],
+                                          on_token=tokens.append)
+                self.assertEqual(result.content.split(), full.split())  # whole answer, seam not repeated
+                self.assertEqual("".join(tokens).split(), full.split())  # and that's what streamed
+                self.assertTrue(any("continuing the answer" in s for s in statuses))
+                last = self.fake.requests[-1]["contents"]
+                self.assertEqual([t["role"] for t in last], ["user", "model", "user"])
+                self.assertIn("cut off", last[-1]["parts"][0]["text"])
+
+    def test_streams_broken_mid_message_are_continued(self) -> None:
+        full = " ".join(f"word{i}" for i in range(60))
+        self.fake.answer = full
+        self.fake.truncate = ("broken", 25)
+        result = self.client.chat("gemini-flash-latest", [{"role": "user", "content": "Solve it"}])
+        self.assertEqual(result.content.split(), full.split())
+
+    def test_answers_that_stop_inside_a_code_block_are_continued(self) -> None:
+        full = "Here is the code:\n```python\ndef f(x):\nreturn x + 1\n```\nDone."
+        self.fake.answer = full
+        self.fake.truncate = ("stop", 5)  # says STOP after "def f(x):", inside the code block
+        result = self.client.chat("gemini-flash-latest", [{"role": "user", "content": "Solve it"}])
+        self.assertEqual(result.content.split(), full.split())
+
+    def test_a_failed_continuation_keeps_the_partial_answer(self) -> None:
+        self.fake.answer = "Here is the code:\n```python\ndef f(x):\nreturn x + 1\n```\nDone."
+        self.fake.truncate = ("max", 5)
+        self.fake.busy_on_continue = True
+        tokens = []
+        result = self.client.chat("gemini-flash-latest", [{"role": "user", "content": "Solve it"}],
+                                  on_token=tokens.append)
+        self.assertTrue(result.content.startswith("Here is the code:\n```python\ndef f(x):"))
+        self.assertIn("Reply **continue**", result.content)
+        self.assertEqual(result.content.count("```") % 2, 0)  # the open code block is closed
+        self.assertEqual("".join(tokens), result.content)  # not restarted with another model
+        streams = [r for r in self.fake.requests if r["path"].endswith(":streamGenerateContent")]
+        self.assertTrue(all("gemini-flash-latest" in r["path"] for r in streams))
+
+    def test_finished_answers_are_not_continued(self) -> None:
+        self.client.chat("gemini-flash-latest", [{"role": "user", "content": "hi"}])
+        streams = [r for r in self.fake.requests if r["path"].endswith(":streamGenerateContent")]
+        self.assertEqual(len(streams), 1)
+
     def test_reasoning_is_only_requested_from_thinking_models(self) -> None:
         self.client.list_models()
         self.client.chat("gemini-2.0-flash", [{"role": "user", "content": "hi"}], think=True)

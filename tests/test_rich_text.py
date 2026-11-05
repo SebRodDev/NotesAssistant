@@ -53,6 +53,19 @@ class RichTextTests(unittest.TestCase):
         self.assertTrue(first[0].endswith(".png") and os.path.exists(first[0]))
         self.assertEqual(first, math_image("x^2", "#ffffff"))
 
+    def test_finished_code_blocks_get_a_copy_link_that_copies_just_that_block(self):
+        from study_assistant.widgets import ChatMessageWidget
+
+        text = "First:\n\n```python\nprint(1)\n```\n\nSecond:\n\n```js\nconsole.log(2)\n```"
+        self.assertNotIn("COPY", render_markdown(text, COLORS, "Menlo"))  # streaming: no links yet
+        self.assertEqual(render_markdown(text, COLORS, "Menlo", copy_links=True).count("⧉ COPY"), 2)
+        message = ChatMessageWidget("assistant", text, [])
+        message.body.linkActivated.emit("copy:1")
+        self.assertEqual(APP.clipboard().text(), "console.log(2)")
+        self.assertIn("✓ COPIED", message.body.text())
+        message.body.linkActivated.emit("https://example.com")  # anything else is ignored
+        self.assertEqual(APP.clipboard().text(), "console.log(2)")
+
     def test_unicode_fallback(self):
         self.assertEqual(latex_to_unicode("\\alpha \\leq \\beta^2"), "α ≤ β²")
 
